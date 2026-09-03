@@ -673,8 +673,9 @@ class RtsV6Handler {
     return p;
   }
 
-  doSdk(clientGuid, id, path, json) {
+    doSdk(clientGuid, id, path, json) {
     let self = this;
+    self.waitForResponse = "sdk";
     let p = new Promise(function (resolve, reject) {
       self.storePromiseMethods("sdk", resolve, reject);
       self.send(
@@ -684,7 +685,10 @@ class RtsV6Handler {
       );
     });
 
-    return p;
+    let timeout = new Promise(function (_resolve, reject) {
+      setTimeout(function () { reject(new Error("SDK proxy timed out")); }, 15000);
+    });
+    return Promise.race([p, timeout]);
   }
 
   doBlesh(port) {

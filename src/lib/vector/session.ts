@@ -1,5 +1,3 @@
-import sodium from "libsodium-wrappers";
-
 import { RtsCliUtil } from "@/vendor/vector-rts/rtsCliUtil.js";
 import { IntBuffer } from "@/vendor/vector-rts/clad.js";
 import { Sessions } from "@/vendor/vector-rts/sessions.js";
@@ -9,6 +7,10 @@ import { RtsV3Handler } from "@/vendor/vector-rts/rtsV3Handler.js";
 import { RtsV4Handler } from "@/vendor/vector-rts/rtsV4Handler.js";
 import { RtsV5Handler } from "@/vendor/vector-rts/rtsV5Handler.js";
 import { RtsV6Handler } from "@/vendor/vector-rts/rtsV6Handler.js";
+
+// libsodium-wrappers is CommonJS; load after sodium.ready in connect().
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sodium: any = null;
 
 export type PairPhase =
   | "idle"
@@ -34,6 +36,7 @@ export type SdkResult = {
   statusCode: number;
   responseType?: string;
   responseBody?: string;
+  path: string;
 };
 
 type RtsHandler = {
@@ -47,9 +50,11 @@ type RtsHandler = {
     path: string,
     json: string,
   ) => Promise<{ value: SdkProxyValue }>;
+  doAnkiAuth?: (sessionToken: string) => Promise<{ value: CloudAuthValue }>;
   onReadyForPin: (fn: () => void) => void;
   onEncryptedConnection: (fn: () => void) => void;
   onPrint: (fn: (msg: string) => void) => void;
+  waitForResponse?: string;
 };
 
 type StatusValue = {
@@ -57,6 +62,8 @@ type StatusValue = {
   wifiSsidHex?: string;
   esn?: string;
   version?: string;
+  hasOwner?: boolean;
+  isCloudAuthed?: boolean;
 };
 
 type WifiIpValue = {
@@ -70,7 +77,24 @@ type SdkProxyValue = {
   responseBody?: string;
 };
 
+type CloudAuthValue = {
+  success?: boolean;
+  statusCode?: number;
+  clientTokenGuid?: string;
+};
+
 const GUID_KEY = "vector-eyes-sdk-guid";
+
+/** Official permanent presets (RobotSettings EyeColor enum). */
+export const EYE_COLOR_ENUM = [
+  { name: "Teal", enum: "TIP_OVER_TEAL", value: 0, hue: 0.42, saturation: 1 },
+  { name: "Orange", enum: "OVERFIT_ORANGE", value: 1, hue: 0.05, saturation: 0.95 },
+  { name: "Yellow", enum: "UNCANNY_YELLOW", value: 2, hue: 0.11, saturation: 1 },
+  { name: "Lime", enum: "NON_LINEAR_LIME", value: 3, hue: 0.21, saturation: 1 },
+  { name: "Sapphire", enum: "SINGULARITY_SAPPHIRE", value: 4, hue: 0.57, saturation: 1 },
+  { name: "Purple", enum: "FALSE_POSITIVE_PURPLE", value: 5, hue: 0.83, saturation: 0.76 },
+  { name: "Green", enum: "CONFUSION_MATRIX_GREEN", value: 6, hue: 0.3, saturation: 1 },
+] as const;
 
 function generateHandshakeMessage(version: number) {
   return [1].concat(IntBuffer.Int32ToLE(version));
@@ -103,6 +127,35 @@ export function storeSdkGuid(guid: string) {
   window.localStorage.setItem(GUID_KEY, guid.trim());
 }
 
+export function nearestEyeColorEnum(hue: number, saturation: number) {
+  let best: (typeof EYE_COLOR_ENUM)[number] = EYE_COLOR_ENUM[0];
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const preset of EYE_COLOR_ENUM) {
+    const dh = Math.min(
+      Math.abs(preset.hue - hue),
+      1 - Math.abs(preset.hue - hue),
+    );
+    const ds = Math.abs(preset.saturation - saturation);
+    const dist = dh * 2 + ds;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = preset;
+    }
+  }
+  return best;
+}
+
+function describeSdkFailure(result: SdkResult) {
+  const body = (result.responseBody || "").trim();
+  if (result.statusCode === 401 || result.statusCode === 403) {
+    return "Vector rejected the SDK guid. Paste the guid= line from ~/.anki_vector/sdk_config.ini (or your WirePod token), then Apply again.";
+  }
+  if (result.statusCode === 0) {
+    return "Vector returned an empty SDK response. His BLE SDK proxy needs a valid client guid before eye color will stick.";
+  }
+  return `Vector returned HTTP ${result.statusCode} for ${result.path}${body ? `: ${body.slice(0, 180)}` : ""}`;
+}
+
 export class VectorSession {
   private ble: InstanceType<typeof VectorBluetooth> | null = null;
   private handler: RtsHandler | null = null;
@@ -114,6 +167,7 @@ export class VectorSession {
   private pinWaiters: Array<(needsPin: boolean) => void> = [];
   private pairedWaiters: Array<() => void> = [];
   private disconnectedHandlers: Array<() => void> = [];
+  private clientGuid = "";
 
   info: VectorInfo | null = null;
   phase: PairPhase = "idle";
@@ -133,8 +187,12 @@ export class VectorSession {
       );
     }
 
+    if (!sodium) {
+      sodium = (await import("libsodium-wrappers")).default;
+    }
     await sodium.ready;
     this.cleanupHandler();
+    this.clientGuid = getStoredSdkGuid();
     this.ble = new VectorBluetooth();
     this.ble.onReceive(this.handshakeListener);
     this.ble.onDisconnected(() => {
@@ -295,36 +353,117 @@ export class VectorSession {
     return this.info;
   }
 
-  async setEyeColor(hue: number, saturation: number, guidOverride?: string) {
+  /**
+   * Authorize the BLE SDK proxy with an Anki/DDL/WirePod session token.
+   * On success, stores the returned clientTokenGuid for eye-color calls.
+   */
+  async authorizeCloud(sessionToken: string) {
+    if (!this.handler?.doAnkiAuth) {
+      throw new Error("This Vector firmware cannot run cloud auth over BLE.");
+    }
+    const token = sessionToken.trim();
+    if (!token) throw new Error("Paste a session token or SDK guid first.");
+
+    // If it already looks like a client guid, just store it.
+    if (token.length >= 16 && !token.includes(" ")) {
+      this.clientGuid = token;
+      storeSdkGuid(token);
+      return { guid: token, via: "guid" as const };
+    }
+
+    const msg = await this.handler.doAnkiAuth(token);
+    const value = msg.value;
+    if (!value.success || !value.clientTokenGuid) {
+      throw new Error(
+        `Cloud auth failed (status ${value.statusCode ?? "?"}). Use the guid= value from sdk_config.ini instead.`,
+      );
+    }
+    this.clientGuid = value.clientTokenGuid;
+    storeSdkGuid(value.clientTokenGuid);
+    return { guid: value.clientTokenGuid, via: "cloud" as const };
+  }
+
+  private async sdkCall(
+    guid: string,
+    path: string,
+    body: Record<string, unknown>,
+  ): Promise<SdkResult> {
     if (!this.handler?.doSdk) {
       throw new Error(
         "This Vector firmware cannot change eye color over BLE. Update him, then pair again.",
       );
     }
-    const guid =
-      (guidOverride ?? getStoredSdkGuid()).trim() ||
-      "00000000-0000-0000-0000-000000000000";
-    const response = await this.handler.doSdk(
-      guid,
-      RtsCliUtil.makeId(),
-      "/v1/set_eye_color",
-      JSON.stringify({ hue, saturation }),
-    );
-    const result: SdkResult = {
+    if (!guid.trim()) {
+      throw new Error(
+        "Missing SDK guid. Paste guid= from ~/.anki_vector/sdk_config.ini, then hit Apply.",
+      );
+    }
+
+    let response: { value: SdkProxyValue };
+    try {
+      response = await this.handler.doSdk(
+        guid.trim(),
+        RtsCliUtil.makeId(),
+        path,
+        JSON.stringify(body),
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "SDK proxy request failed.";
+      // RtsResponse NotCloudAuthorized often lands here once waitForResponse is set.
+      if (/not cloud authorized|unauthorized|timeout/i.test(message)) {
+        throw new Error(
+          "Vector says the SDK proxy is not authorized. Paste a valid guid from sdk_config.ini (or authorize with a WirePod/Anki session token).",
+        );
+      }
+      throw err instanceof Error ? err : new Error(message);
+    }
+
+    return {
       statusCode: Number(response.value.statusCode ?? 0),
       responseType: response.value.responseType,
       responseBody: response.value.responseBody,
+      path,
     };
-    if (result.statusCode && result.statusCode !== 200) {
-      const err = new Error(
-        result.statusCode === 401 || result.statusCode === 403
-          ? "Vector accepted the PIN, but his SDK gateway wants a client guid. Paste the guid from ~/.anki_vector/sdk_config.ini."
-          : `Vector returned ${result.statusCode} for set_eye_color.`,
+  }
+
+  async setEyeColor(hue: number, saturation: number, guidOverride?: string) {
+    const guid = (guidOverride ?? this.clientGuid ?? getStoredSdkGuid()).trim();
+    if (!guid) {
+      throw new Error(
+        "Eye color needs your SDK guid. Pairing alone is not enough — paste guid= from ~/.anki_vector/sdk_config.ini below, then Apply.",
       );
-      (err as Error & { sdk: SdkResult }).sdk = result;
-      throw err;
     }
-    return result;
+    this.clientGuid = guid;
+    storeSdkGuid(guid);
+
+    // 1) Temporary RGB via SDK (what the Python SDK uses).
+    const rgb = await this.sdkCall(guid, "/v1/set_eye_color", {
+      hue,
+      saturation,
+    });
+    if (rgb.statusCode !== 200) {
+      throw Object.assign(new Error(describeSdkFailure(rgb)), { sdk: rgb });
+    }
+
+    // 2) Also push the nearest permanent preset so idle behavior doesn't snap back.
+    const preset = nearestEyeColorEnum(hue, saturation);
+    try {
+      const settings = await this.sdkCall(guid, "/v1/update_settings", {
+        settings: { eye_color: preset.enum },
+      });
+      if (settings.statusCode !== 200) {
+        // Non-fatal: RGB call already succeeded.
+        return {
+          ...rgb,
+          responseBody: `${rgb.responseBody || ""} | preset ${preset.name} status ${settings.statusCode}`,
+        };
+      }
+    } catch {
+      // Ignore preset failure if RGB worked.
+    }
+
+    return rgb;
   }
 
   disconnect() {

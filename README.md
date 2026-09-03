@@ -38,11 +38,20 @@ Open [http://127.0.0.1:43147](http://127.0.0.1:43147). Localhost counts as a sec
 
 `/?demo=1` opens the wheel without a robot, so you can check the UI.
 
-## If eye color is rejected after a good PIN
+## If eye color does nothing after a good PIN
 
-Some firmware still wants the SDK `guid` from `~/.anki_vector/sdk_config.ini` (the `guid=` line). Paste it into the SDK guid field on the paired screen.
+The backpack PIN only opens the BLE tunnel. Eye color rides Vector’s **SDK proxy**, which requires the client `guid` from:
 
-Factory RTS v2/v3 robots have no BLE SDK proxy. Update Vector before using the wheel.
+```ini
+# ~/.anki_vector/sdk_config.ini
+guid = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+Paste that into the **SDK guid** field on the paired screen, then hit **Apply color**.
+
+WirePod: use the client token from your WirePod / SDK configure step.
+
+Factory RTS v2/v3 robots have no BLE SDK proxy. Update Vector first.
 
 ## Stack
 
