@@ -172,7 +172,7 @@ type LocalFetchInit = RequestInit & {
  * HTTP to Vector's LAN eng console from a Vercel HTTPS page.
  * Uses Chrome Local Network Access (`targetAddressSpace: "local"`).
  */
-async function hitRobotHttp(url: string, init?: RequestInit): Promise<boolean> {
+async function hitRobotHttp(url: string, init?: RequestInit): Promise<"ok" | "opaque" | "fail"> {
   const localInit: LocalFetchInit = {
     ...init,
     cache: "no-store",
@@ -181,19 +181,28 @@ async function hitRobotHttp(url: string, init?: RequestInit): Promise<boolean> {
 
   try {
     const res = await fetch(url, { ...localInit, mode: "cors" });
-    if (res.ok || res.status === 200) return true;
-    if (res.status > 0 && res.status < 500) return true;
+    if (res.ok || (res.status > 0 && res.status < 500)) return "ok";
   } catch {
     // fall through
   }
 
   try {
     await fetch(url, { ...localInit, mode: "no-cors" });
-    return true;
+    // Opaque — request likely left the browser, but we cannot read the body.
+    return "opaque";
   } catch {
     // fall through
   }
 
+  return "fail";
+}
+
+async function probeConsoleReachable(ip: string): Promise<boolean> {
+  for (const port of CONSOLE_PORTS) {
+    const url = `http://${ip}:${port}/consolevarget?key=kProcFace_Hue`;
+    const result = await hitRobotHttp(url);
+    if (result === "ok" || result === "opaque") return true;
+  }
   return false;
 }
 
@@ -227,6 +236,11 @@ async function setEyeColorViaConsole(
 
   if (await setEyeColorViaLocalProxy(ip, hue, saturation)) {
     return true;
+  }
+
+  // Prove we can reach the eng console before claiming success.
+  if (!(await probeConsoleReachable(ip))) {
+    return false;
   }
 
   const h = Number(hue.toFixed(4));
@@ -268,7 +282,7 @@ async function setEyeColorViaConsole(
       }),
     ]);
 
-    if (results.some(Boolean)) anyOk = true;
+    if (results.some((r) => r === "ok" || r === "opaque")) anyOk = true;
   }
 
   return anyOk;
@@ -480,63 +494,24 @@ export class VectorSession {
     await this.refreshInfo();
     const ip = this.info?.ip;
 
-    if (ip) {
-      const ok = await setEyeColorViaConsole(ip, hue, saturation);
-      if (ok) {
-        return {
-          statusCode: 200,
-          path: "/consolefunccall",
-          via: "console",
-        };
-      }
-    }
-
-    // Last-ditch: BLE SDK with no token. Some unlocked CFWs skip gateway auth.
-    if (this.handler?.doSdk) {
-      try {
-        const response = await this.handler.doSdk(
-          "",
-          RtsCliUtil.makeId(),
-          "/v1/set_eye_color",
-          JSON.stringify({ hue, saturation }),
-        );
-        const statusCode = Number(response.value.statusCode ?? 0);
-        if (statusCode === 200) {
-          try {
-            await this.handler.doSdk(
-              "",
-              RtsCliUtil.makeId(),
-              "/v1/update_settings",
-              JSON.stringify({
-                update_settings: true,
-                settings: {
-                  custom_eye_color: { enabled: true, hue, saturation },
-                },
-              }),
-            );
-          } catch {
-            // live color is enough
-          }
-          return {
-            statusCode: 200,
-            path: "/v1/set_eye_color",
-            via: "sdk",
-          };
-        }
-      } catch {
-        // continue to error below
-      }
-    }
-
     if (!ip) {
       throw new Error(
         "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try the wheel again.",
       );
     }
 
-    throw new Error(
-      `Couldn’t reach Vector at ${ip}:8889 from this page. Stay on the same Wi-Fi. In Chrome, click Allow when it asks for local network access (needed for Vercel HTTPS → robot HTTP).`,
-    );
+    const ok = await setEyeColorViaConsole(ip, hue, saturation);
+    if (!ok) {
+      throw new Error(
+        `Couldn’t reach Vector at ${ip}:8889. Same Wi-Fi required. In Chrome click Allow for local network access (Vercel HTTPS → robot). No guid / Escape Pod needed — this build only uses his unlocked CFW console.`,
+      );
+    }
+
+    return {
+      statusCode: 200,
+      path: "/consolefunccall",
+      via: "console",
+    };
   }
 
   disconnect() {

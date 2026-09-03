@@ -207,7 +207,10 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
             Works on Vercel. Double-click his backpack, enter the PIN, paint his
-            eyes. Unlocked CFW — no Wire-Pod.
+            eyes. Unlocked CFW — no Wire-Pod, no guid paste.
+          </p>
+          <p className="mt-1 font-mono text-[10px] text-zinc-600">
+            build console-only · no SDK guid
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
