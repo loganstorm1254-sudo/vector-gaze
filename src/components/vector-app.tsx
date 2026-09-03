@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { type Hs } from "@/lib/vector/color";
 import {
   bluetoothSupported,
+  ensureLocalNetworkAccess,
   EYE_COLOR_ENUM,
   VectorSession,
   type PairPhase,
@@ -128,10 +129,19 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     try {
       await session.submitPin(pin);
       setInfo(session.info);
+      // Trigger Chrome Local Network Access prompt early (needed on Vercel HTTPS).
+      void ensureLocalNetworkAccess();
+      if (session.info?.ip) {
+        void fetch(`http://${session.info.ip}:8889/consolevarget?key=kProcFace_Hue`, {
+          mode: "no-cors",
+          cache: "no-store",
+          ...({ targetAddressSpace: "local" } as RequestInit),
+        }).catch(() => undefined);
+      }
       setPhase("eyes");
       setLastSent(
         session.info?.ip
-          ? `PIN accepted · talking to ${session.info.ip} on your LAN — no cloud.`
+          ? `PIN accepted · ${session.info.ip}. If Chrome asks for local network access, click Allow.`
           : "PIN accepted. Connect Vector to Wi-Fi so eye color can reach him.",
       );
     } catch (err) {
@@ -196,8 +206,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             Eye Color
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
-            Double-click his backpack, enter the PIN, paint his eyes. Unlocked
-            CFW — no Wire-Pod, no cloud.
+            Works on Vercel. Double-click his backpack, enter the PIN, paint his
+            eyes. Unlocked CFW — no Wire-Pod.
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
@@ -217,7 +227,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             <CardTitle>Find Vector over BLE</CardTitle>
             <CardDescription>
               Chrome or Edge on a computer or Android. Same Wi-Fi as Vector.
-              Color goes to his onboard console — nothing phones home.
+              When Chrome asks for local network access, click Allow — that lets
+              this HTTPS site talk to him on your LAN.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-5">

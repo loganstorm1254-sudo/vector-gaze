@@ -132,48 +132,66 @@ export function nearestEyeColorEnum(hue: number, saturation: number) {
   return best;
 }
 
+function isLocalDevHost() {
+  if (typeof window === "undefined") return false;
+  const host = window.location.hostname;
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "[::1]" ||
+    host.endsWith(".local")
+  );
+}
+
 /**
- * Fire-and-forget HTTP to Vector's LAN eng console.
- * Works without Wire-Pod / Anki / Escape Pod — unlocked CFW exposes these.
- * Tries CORS fetch, no-cors fetch, then image beacons (helps HTTPS→HTTP).
+ * Ask Chrome for Local Network Access so a Vercel HTTPS page can hit
+ * http://192.168.x.x (mixed content is exempted once permission is granted).
+ */
+export async function ensureLocalNetworkAccess(): Promise<boolean> {
+  if (typeof navigator === "undefined") return false;
+
+  const names = ["local-network", "local-network-access"] as const;
+  for (const name of names) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const status = await (navigator.permissions as any).query({ name });
+      if (status?.state === "granted") return true;
+      if (status?.state === "denied") return false;
+    } catch {
+      // unsupported name — try the next
+    }
+  }
+  return true; // unknown / prompt will happen on first fetch
+}
+
+type LocalFetchInit = RequestInit & {
+  targetAddressSpace?: "local" | "loopback" | "public";
+};
+
+/**
+ * HTTP to Vector's LAN eng console from a Vercel HTTPS page.
+ * Uses Chrome Local Network Access (`targetAddressSpace: "local"`).
  */
 async function hitRobotHttp(url: string, init?: RequestInit): Promise<boolean> {
+  const localInit: LocalFetchInit = {
+    ...init,
+    cache: "no-store",
+    targetAddressSpace: "local",
+  };
+
   try {
-    const res = await fetch(url, {
-      ...init,
-      mode: "cors",
-      cache: "no-store",
-    });
+    const res = await fetch(url, { ...localInit, mode: "cors" });
     if (res.ok || res.status === 200) return true;
-    // Some eng builds return 200 with text/html body either way.
     if (res.status > 0 && res.status < 500) return true;
   } catch {
     // fall through
   }
 
   try {
-    await fetch(url, {
-      ...init,
-      mode: "no-cors",
-      cache: "no-store",
-    });
-    // Opaque response — assume the packet left the browser.
+    await fetch(url, { ...localInit, mode: "no-cors" });
     return true;
   } catch {
     // fall through
-  }
-
-  // Passive beacon: passive mixed content often still allowed from HTTPS pages.
-  if (!init || !init.method || init.method.toUpperCase() === "GET") {
-    await new Promise<boolean>((resolve) => {
-      const img = new Image();
-      const done = () => resolve(true);
-      img.onload = done;
-      img.onerror = done;
-      img.src = url;
-      window.setTimeout(done, 800);
-    });
-    return true;
   }
 
   return false;
@@ -184,6 +202,8 @@ async function setEyeColorViaLocalProxy(
   hue: number,
   saturation: number,
 ): Promise<boolean> {
+  // Only when Next is on the same LAN. Vercel cloud cannot reach 192.168.x.x.
+  if (!isLocalDevHost()) return false;
   try {
     const res = await fetch("/api/vector-console", {
       method: "POST",
@@ -203,8 +223,8 @@ async function setEyeColorViaConsole(
   hue: number,
   saturation: number,
 ): Promise<boolean> {
-  // When Next is running on your machine, the API route can reach Vector even
-  // if the browser blocks private-network HTTP.
+  await ensureLocalNetworkAccess();
+
   if (await setEyeColorViaLocalProxy(ip, hue, saturation)) {
     return true;
   }
@@ -216,7 +236,6 @@ async function setEyeColorViaConsole(
   for (const port of CONSOLE_PORTS) {
     const base = `http://${ip}:${port}`;
 
-    // Preferred: console functions call SetHue/SetSaturation (updates face images).
     const hueFn = `${base}/consolefunccall?func=ProcFace_Hue&args=${encodeURIComponent(String(h))}`;
     const satFn = `${base}/consolefunccall?func=ProcFace_Saturation&args=${encodeURIComponent(String(s))}`;
     const hueVar = `${base}/consolevarset?key=${encodeURIComponent("kProcFace_Hue")}&value=${encodeURIComponent(String(h))}`;
@@ -227,7 +246,6 @@ async function setEyeColorViaConsole(
       hitRobotHttp(satFn),
       hitRobotHttp(hueVar),
       hitRobotHttp(satVar),
-      // POST variants (jquery-style) for builds that ignore GET bodies.
       hitRobotHttp(`${base}/consolefunccall`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -517,7 +535,7 @@ export class VectorSession {
     }
 
     throw new Error(
-      `Couldn’t reach Vector’s local console at ${ip}:8889. Stay on the same Wi-Fi. Unlocked CFW must expose the eng console (ports 8888/8889).`,
+      `Couldn’t reach Vector at ${ip}:8889 from this page. Stay on the same Wi-Fi. In Chrome, click Allow when it asks for local network access (needed for Vercel HTTPS → robot HTTP).`,
     );
   }
 
