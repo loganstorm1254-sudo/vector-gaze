@@ -253,6 +253,19 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
               )}
               Find Vector
             </Button>
+            <Button
+              variant="ghost"
+              className="w-full text-zinc-400"
+              onClick={() => {
+                setPhase("eyes");
+                setPairPhase("paired");
+                setLastSent(
+                  "Preview only — connect a real Vector to push this color.",
+                );
+              }}
+            >
+              Preview the color wheel
+            </Button>
           </CardContent>
         </Card>
       ) : null}
