@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bluetooth, KeyRound, Loader2, Volume2, Wifi } from "lucide-react";
+import { Bluetooth, ImageIcon, KeyRound, Loader2, Volume2, Wifi } from "lucide-react";
 
 import { ColorWheel } from "@/components/color-wheel";
 import { VectorFace } from "@/components/vector-face";
@@ -16,6 +16,13 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { type Hs } from "@/lib/vector/color";
+import {
+  downloadOverlayJpeg,
+  FACE_OVERLAYS,
+  prepareOverlayJpeg,
+  type FaceOverlayId,
+  type PreparedOverlayJpeg,
+} from "@/lib/vector/overlay";
 import {
   bluetoothSupported,
   ensureLocalNetworkAccess,
@@ -53,10 +60,16 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
   );
   const [hs, setHs] = useState<Hs>({ hue: 0.42, saturation: 1 });
   const [volume, setVolume] = useState<VolumeLevel>(3);
+  const [overlayId, setOverlayId] = useState<FaceOverlayId>("off");
+  const [overlayOpacity, setOverlayOpacity] = useState(0.8);
+  const [customPreview, setCustomPreview] = useState<PreparedOverlayJpeg | null>(
+    null,
+  );
   const [lastSent, setLastSent] = useState<string | null>(null);
   const [bleOk, setBleOk] = useState(false);
   const sendTimer = useRef<number | null>(null);
   const volumeTimer = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setBleOk(bluetoothSupported());
@@ -221,6 +234,81 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     }
   }
 
+  async function pushOverlay(
+    id: FaceOverlayId,
+    opacity = overlayOpacity,
+    prepared: PreparedOverlayJpeg | null = customPreview,
+  ) {
+    const session = sessionRef.current;
+    const entry = FACE_OVERLAYS.find((item) => item.id === id);
+    if (!entry) return;
+
+    if (demo) {
+      setOverlayId(id);
+      setLastSent("Preview only — connect a real Vector to push overlays.");
+      return;
+    }
+    if (!session) return;
+
+    setSending(true);
+    setOverlayId(id);
+    setLastSent(
+      id === "custom"
+        ? "Loading custom overlay…"
+        : id === "off"
+          ? "Turning overlay off…"
+          : `Loading ${entry.name} overlay…`,
+    );
+
+    try {
+      if (id === "custom") {
+        if (!prepared) {
+          throw new Error("Pick a custom image first (184×96 JPEG on the robot).");
+        }
+        const uploaded = await session.uploadCustomOverlay(prepared.blob);
+        if (!uploaded) {
+          downloadOverlayJpeg(prepared.blob);
+          setError(
+            `Couldn’t write customFaceOverlay.jpg over HTTP (stock WireOS blocks PUT). Downloaded the 184×96 JPG — SCP it once: scp customFaceOverlay.jpg root@${session.info?.ip ?? "VECTOR_IP"}:/data/data/ then tap Custom again.`,
+          );
+        } else {
+          setError(null);
+        }
+      }
+
+      await session.setEyeOverlay(entry.flavor, opacity);
+      setLastSent(
+        id === "off"
+          ? "Eye overlay off."
+          : `${entry.name} overlay loaded via Face console — no servers.`,
+      );
+      if (id !== "custom") setError(null);
+      setInfo(session.info);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not set overlay.");
+      setLastSent(null);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function onPickCustomImage(file: File | null) {
+    if (!file) return;
+    setError(null);
+    try {
+      const prepared = await prepareOverlayJpeg(file);
+      setCustomPreview(prepared);
+      setOverlayId("custom");
+      if (demo) {
+        setLastSent("Preview only — connect a real Vector to push this overlay.");
+        return;
+      }
+      await pushOverlay("custom", overlayOpacity, prepared);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not read that image.");
+    }
+  }
+
   function disconnect() {
     sessionRef.current?.disconnect();
     sessionRef.current = null;
@@ -229,6 +317,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     setPin("");
     setLastSent(null);
     setError(null);
+    setOverlayId("off");
+    setCustomPreview(null);
   }
 
   return (
@@ -239,15 +329,15 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             Anki Vector
           </p>
           <h1 className="font-heading text-3xl text-white sm:text-4xl">
-            Eyes & Volume
+            Eyes, Volume & Overlays
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
             Works on Vercel. Double-click his backpack, enter the PIN, paint his
-            eyes and set speaker volume. Unlocked CFW — no Wire-Pod, no guid
-            paste.
+            eyes, set volume, and pick a Face overlay. Unlocked CFW — no
+            Wire-Pod, no guid paste.
           </p>
           <p className="mt-1 font-mono text-[10px] text-zinc-600">
-            build console-only · eyes + volume · no SDK guid
+            build console-only · eyes + volume + overlays · no SDK guid
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
@@ -290,7 +380,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-teal-500/15 text-xs text-teal-200">
                   3
                 </span>
-                Find Vector, type that PIN, then set eyes and volume.
+                Find Vector, type that PIN, then set eyes, volume, and overlays.
               </li>
             </ol>
 
@@ -497,6 +587,155 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 {sending ? <Loader2 className="size-4 animate-spin" /> : null}
                 Apply volume
               </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-zinc-950/80">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <ImageIcon className="size-4 text-teal-300" />
+                Eye overlays
+              </CardTitle>
+              <CardDescription>
+                Same Face menu as{" "}
+                <code className="text-teal-200/90">:8889/consolevars</code> —
+                enable{" "}
+                <code className="text-teal-200/90">ProcFace_CustomEyes</code>,
+                pick a flavor, then{" "}
+                <code className="text-teal-200/90">LOOK_LoadFaceOverlay</code>.
+                Custom expects{" "}
+                <code className="text-teal-200/90">
+                  /data/data/customFaceOverlay.jpg
+                </code>{" "}
+                (184×96).
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-5">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5">
+                {FACE_OVERLAYS.map((entry) => {
+                  const selected = overlayId === entry.id;
+                  return (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      disabled={sending}
+                      onClick={() => {
+                        if (entry.id === "custom") {
+                          if (customPreview) {
+                            void pushOverlay("custom");
+                          } else {
+                            fileInputRef.current?.click();
+                          }
+                          return;
+                        }
+                        void pushOverlay(entry.id);
+                      }}
+                      className={
+                        selected
+                          ? "overflow-hidden rounded-xl border border-teal-300/50 bg-teal-400/10 text-left disabled:opacity-50"
+                          : "overflow-hidden rounded-xl border border-white/10 bg-zinc-900/60 text-left hover:border-teal-300/40 disabled:opacity-50"
+                      }
+                    >
+                      <div className="relative aspect-[184/96] bg-zinc-950">
+                        {entry.thumb ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={entry.thumb}
+                            alt=""
+                            className="size-full object-cover"
+                          />
+                        ) : entry.id === "custom" && customPreview ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={customPreview.dataUrl}
+                            alt=""
+                            className="size-full object-cover"
+                          />
+                        ) : (
+                          <div className="flex size-full items-center justify-center text-[11px] text-zinc-500">
+                            {entry.id === "off" ? "None" : "Pick file"}
+                          </div>
+                        )}
+                      </div>
+                      <div className="px-2 py-1.5 text-xs text-zinc-200">
+                        {entry.name}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <label className="flex flex-1 flex-col gap-1 text-sm text-zinc-300">
+                  <span className="text-xs tracking-wide text-zinc-500 uppercase">
+                    Overlay opacity · {overlayOpacity.toFixed(2)}
+                  </span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={overlayOpacity}
+                    disabled={sending || overlayId === "off"}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      setOverlayOpacity(next);
+                    }}
+                    onPointerUp={() => {
+                      if (overlayId !== "off") {
+                        void pushOverlay(overlayId, overlayOpacity);
+                      }
+                    }}
+                    className="w-full accent-teal-400"
+                  />
+                </label>
+              </div>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0] ?? null;
+                  void onPickCustomImage(file);
+                  event.target.value = "";
+                }}
+              />
+
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={sending}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Choose custom image
+                </Button>
+                <Button
+                  type="button"
+                  className="bg-teal-400 text-zinc-950 hover:bg-teal-300"
+                  disabled={sending || demo || overlayId === "off"}
+                  onClick={() => void pushOverlay(overlayId)}
+                >
+                  {sending ? <Loader2 className="size-4 animate-spin" /> : null}
+                  Apply overlay
+                </Button>
+                {customPreview ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={sending}
+                    onClick={() => downloadOverlayJpeg(customPreview.blob)}
+                  >
+                    Download 184×96 JPG
+                  </Button>
+                ) : null}
+              </div>
+
+              {lastSent ? (
+                <p className="text-sm text-teal-200/90">{lastSent}</p>
+              ) : null}
             </CardContent>
           </Card>
         </div>

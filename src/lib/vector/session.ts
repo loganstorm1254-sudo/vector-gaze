@@ -105,6 +105,13 @@ export const VOLUME_LEVELS = [
 
 export type VolumeLevel = (typeof VOLUME_LEVELS)[number]["value"];
 
+/** WireOS Face menu — kProcFace_FlavorOfGay indices (Custom = 8). */
+export type EyeOverlayRequest = {
+  /** null disables ProcFace_CustomEyes */
+  flavor: number | null;
+  opacity?: number;
+};
+
 function generateHandshakeMessage(version: number) {
   return [1].concat(IntBuffer.Int32ToLE(version));
 }
@@ -371,6 +378,171 @@ async function setVolumeViaConsole(
   return anyOk;
 }
 
+async function setEyeOverlayViaLocalProxy(
+  ip: string,
+  flavor: number | null,
+  opacity: number,
+): Promise<boolean> {
+  if (!isLocalDevHost()) return false;
+  try {
+    const res = await fetch("/api/vector-console", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ip,
+        action: "overlay",
+        flavor,
+        opacity,
+      }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { ok?: boolean };
+    return Boolean(data.ok);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * WireOS Face menu (:8889/consolevars → Face):
+ * kProcFace_CustomEyes + kProcFace_FlavorOfGay + LOOK_LoadFaceOverlay.
+ */
+async function setEyeOverlayViaConsole(
+  ip: string,
+  flavor: number | null,
+  opacity: number,
+): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+
+  if (await setEyeOverlayViaLocalProxy(ip, flavor, opacity)) {
+    return true;
+  }
+
+  if (!(await probeConsoleReachable(ip))) {
+    return false;
+  }
+
+  const enabled = flavor !== null;
+  const opacityClamped = Math.min(1, Math.max(0, opacity));
+  let anyOk = false;
+
+  for (const port of CONSOLE_PORTS) {
+    const base = `http://${ip}:${port}`;
+    const calls: Array<Promise<"ok" | "opaque" | "fail">> = [];
+
+    for (const [key, value] of [
+      ["kProcFace_CustomEyes", enabled ? "true" : "false"],
+      ["ProcFace_CustomEyes", enabled ? "true" : "false"],
+      ["kProcFace_CustomEyeOpacity", String(opacityClamped)],
+      ["ProcFace_CustomEyeOpacity", String(opacityClamped)],
+    ] as const) {
+      calls.push(
+        hitRobotHttp(
+          `${base}/consolevarset?key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`,
+        ),
+      );
+      calls.push(
+        hitRobotHttp(`${base}/consolevarset`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `key=${encodeURIComponent(key)}&value=${encodeURIComponent(value)}`,
+        }),
+      );
+    }
+
+    if (enabled && flavor !== null) {
+      for (const key of ["kProcFace_FlavorOfGay", "ProcFace_FlavorOfGay"]) {
+        calls.push(
+          hitRobotHttp(
+            `${base}/consolevarset?key=${encodeURIComponent(key)}&value=${encodeURIComponent(String(flavor))}`,
+          ),
+        );
+        calls.push(
+          hitRobotHttp(`${base}/consolevarset`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: `key=${encodeURIComponent(key)}&value=${encodeURIComponent(String(flavor))}`,
+          }),
+        );
+      }
+
+      calls.push(
+        hitRobotHttp(
+          `${base}/consolefunccall?func=LOOK_LoadFaceOverlay&args=`,
+        ),
+      );
+      calls.push(
+        hitRobotHttp(`${base}/consolefunccall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "func=LOOK_LoadFaceOverlay&args=",
+        }),
+      );
+    }
+
+    const results = await Promise.all(calls);
+    if (results.some((r) => r === "ok" || r === "opaque")) anyOk = true;
+  }
+
+  return anyOk;
+}
+
+/**
+ * Best-effort push of customFaceOverlay.jpg to the robot.
+ * Stock WireOS serves the eng console without PUT, so this often fails —
+ * callers should fall back to SCP instructions.
+ */
+export async function uploadCustomOverlayJpeg(
+  ip: string,
+  jpeg: Blob,
+): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+
+  if (isLocalDevHost()) {
+    try {
+      const buf = new Uint8Array(await jpeg.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < buf.length; i += 1) binary += String.fromCharCode(buf[i]!);
+      const res = await fetch("/api/vector-console", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ip,
+          action: "overlay-upload",
+          jpegBase64: btoa(binary),
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { ok?: boolean };
+        if (data.ok) return true;
+      }
+    } catch {
+      // fall through to direct browser PUT attempts
+    }
+  }
+
+  const paths = [
+    "/persistent/../../customFaceOverlay.jpg",
+    "/persistent/customFaceOverlay.jpg",
+    "/cache/../customFaceOverlay.jpg",
+    "/customFaceOverlay.jpg",
+  ];
+
+  for (const port of CONSOLE_PORTS) {
+    for (const path of paths) {
+      const url = `http://${ip}:${port}${path}`;
+      const result = await hitRobotHttp(url, {
+        method: "PUT",
+        headers: { "Content-Type": "image/jpeg" },
+        body: jpeg,
+      });
+      if (result === "ok") return true;
+    }
+  }
+
+  return false;
+}
+
 export class VectorSession {
   private ble: InstanceType<typeof VectorBluetooth> | null = null;
   private handler: RtsHandler | null = null;
@@ -624,6 +796,53 @@ export class VectorSession {
       path: "/consolefunccall?func=DebugSetMasterVolume",
       via: "console",
     };
+  }
+
+  /**
+   * Face overlay from unlocked CFW Face console menu
+   * (ProcFace_CustomEyes + FlavorOfGay + LOOK_LoadFaceOverlay).
+   */
+  async setEyeOverlay(
+    flavor: number | null,
+    opacity = 0.8,
+  ): Promise<SdkResult> {
+    if (flavor !== null && (!Number.isInteger(flavor) || flavor < 0 || flavor > 8)) {
+      throw new Error("Overlay flavor must be null (off) or 0–8.");
+    }
+
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try overlays again.",
+      );
+    }
+
+    const ok = await setEyeOverlayViaConsole(ip, flavor, opacity);
+    if (!ok) {
+      throw new Error(
+        `Couldn’t reach Vector’s face console at ${ip}:8889 for overlays. Same Wi-Fi + Allow local network access.`,
+      );
+    }
+
+    return {
+      statusCode: 200,
+      path: "/consolefunccall?func=LOOK_LoadFaceOverlay",
+      via: "console",
+    };
+  }
+
+  /** Push a prepared 184×96 JPEG for the Custom overlay slot. */
+  async uploadCustomOverlay(jpeg: Blob): Promise<boolean> {
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try the custom overlay again.",
+      );
+    }
+    return uploadCustomOverlayJpeg(ip, jpeg);
   }
 
   disconnect() {
