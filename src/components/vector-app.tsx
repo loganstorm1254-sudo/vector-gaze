@@ -15,12 +15,10 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { VECTOR_PRESETS, type Hs } from "@/lib/vector/color";
+import { type Hs } from "@/lib/vector/color";
 import {
   bluetoothSupported,
   EYE_COLOR_ENUM,
-  getStoredSdkGuid,
-  storeSdkGuid,
   VectorSession,
   type PairPhase,
   type VectorInfo,
@@ -51,14 +49,12 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       : null,
   );
   const [hs, setHs] = useState<Hs>({ hue: 0.42, saturation: 1 });
-  const [guid, setGuid] = useState("");
   const [lastSent, setLastSent] = useState<string | null>(null);
   const [bleOk, setBleOk] = useState(false);
   const sendTimer = useRef<number | null>(null);
 
   useEffect(() => {
     setBleOk(bluetoothSupported());
-    setGuid(getStoredSdkGuid());
   }, []);
 
   useEffect(() => {
@@ -77,9 +73,9 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       case "need-pin":
         return "Waiting for PIN";
       case "authorizing":
-        return "Checking PIN";
+        return "Authorizing";
       case "paired":
-        return "Paired";
+        return "Ready";
       case "disconnected":
         return "Disconnected";
       default:
@@ -112,12 +108,16 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
         setPhase("pin");
         return;
       }
+      // Reconnect path — still mint SDK auth.
+      setBusy(true);
+      await session.ensureSdkAuthorized();
       setInfo(session.info);
       setPhase("eyes");
     } catch (err) {
-      setBusy(false);
       setPairPhase("idle");
       setError(err instanceof Error ? err.message : "Could not find Vector.");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -130,11 +130,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       await session.submitPin(pin);
       setInfo(session.info);
       setPhase("eyes");
-      if (!getStoredSdkGuid() && !guid) {
-        setError(
-          "Paired. Eye color still needs your SDK guid — paste guid= from ~/.anki_vector/sdk_config.ini, then Apply color.",
-        );
-      }
+      setLastSent("Paired and authorized. Drag the wheel.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Pairing failed.");
     } finally {
@@ -148,45 +144,23 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       setLastSent("Preview only — connect a real Vector to push this color.");
       return;
     }
-    if (!(guid || getStoredSdkGuid()).trim()) {
-      setError(
-        "Add your SDK guid below before colors will reach Vector. Pairing the PIN is only step one.",
-      );
-      return;
-    }
     if (sendTimer.current) window.clearTimeout(sendTimer.current);
     sendTimer.current = window.setTimeout(() => {
       void pushEyeColor(next);
     }, 280);
   }
 
-  async function pushEyeColor(next: Hs, guidOverride?: string) {
+  async function pushEyeColor(next: Hs) {
     const session = sessionRef.current;
     if (!session) return;
-    const useGuid = (guidOverride ?? guid).trim();
-    if (!useGuid) {
-      setError(
-        "Paste the guid= value from ~/.anki_vector/sdk_config.ini, then Apply color.",
-      );
-      return;
-    }
     setSending(true);
     setLastSent("Sending to Vector…");
     try {
-      storeSdkGuid(useGuid);
-      const result = await session.setEyeColor(
-        next.hue,
-        next.saturation,
-        useGuid,
-      );
-      setLastSent(
-        `Applied (SDK ${result.statusCode}). Watch his face — temporary RGB plus nearest permanent preset.`,
-      );
+      await session.setEyeColor(next.hue, next.saturation);
+      setLastSent("Eye color applied.");
       setError(null);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Could not set eye color.";
-      setError(message);
+      setError(err instanceof Error ? err.message : "Could not set eye color.");
       setLastSent(null);
     } finally {
       setSending(false);
@@ -214,8 +188,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             Eye Color
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
-            Pair over Bluetooth, enter the backpack PIN, then paste your SDK
-            guid and paint his eyes. Stay on his Wi-Fi.
+            Double-click his backpack, enter the PIN on his face, then paint his
+            eyes. No SDK codes.
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
@@ -234,9 +208,9 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           <CardHeader>
             <CardTitle>Find Vector over BLE</CardTitle>
             <CardDescription>
-              Chrome or Edge, with Bluetooth on. iPhone Safari cannot do this.
-              Pairing alone will not change his eyes — you also need the SDK
-              guid from sdk_config.ini.
+              Chrome or Edge on a computer or Android. Works best with Escape
+              Pod / Wire-Pod firmware — we authorize the eye-color tunnel
+              automatically after the PIN.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-5">
@@ -245,30 +219,27 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-teal-500/15 text-xs text-teal-200">
                   1
                 </span>
-                Put Vector on his charger and wait until his eyes are up.
+                Put Vector on his charger until his eyes are up.
               </li>
               <li className="flex gap-3">
                 <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-teal-500/15 text-xs text-teal-200">
                   2
                 </span>
-                Double-click the backpack button — the raised key on his LED
-                strip. He should show a key icon and a 6-digit PIN.
+                Double-click the backpack button so the key icon and 6-digit PIN
+                show.
               </li>
               <li className="flex gap-3">
                 <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-teal-500/15 text-xs text-teal-200">
                   3
                 </span>
-                Click Find Vector, enter the PIN, then paste{" "}
-                <code className="text-zinc-100">guid=</code> from{" "}
-                <code className="text-zinc-100">~/.anki_vector/sdk_config.ini</code>
-                .
+                Find Vector, type that PIN, then use the wheel.
               </li>
             </ol>
 
             {!bleOk && !demo ? (
               <p className="rounded-lg bg-amber-950/50 px-3 py-2 text-sm text-amber-100">
-                This browser has no Web Bluetooth. Open the Vercel URL in
-                Chrome or Edge on a computer or Android phone.
+                This browser has no Web Bluetooth. Open the site in Chrome or
+                Edge.
               </p>
             ) : null}
 
@@ -307,11 +278,11 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <KeyRound className="size-4 text-teal-300" />
-              Enter the backpack PIN
+              Enter the PIN on his face
             </CardTitle>
             <CardDescription>
-              Type the 6 digits on his face. That code is the pairing secret —
-              it is not stored on the server.
+              That’s the only code. After it checks out we authorize eye color
+              automatically.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -348,10 +319,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             <CardHeader>
               <CardTitle>RGB wheel</CardTitle>
               <CardDescription>
-                Requires a valid SDK guid. We send{" "}
-                <code className="text-zinc-300">/v1/set_eye_color</code> and
-                the nearest permanent preset via{" "}
-                <code className="text-zinc-300">update_settings</code>.
+                Writes permanent custom eye color the same way Wire-Pod does.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-5">
@@ -363,23 +331,6 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
               />
               <div className="flex flex-wrap gap-2">
                 {EYE_COLOR_ENUM.map((preset) => (
-                  <button
-                    key={preset.name}
-                    type="button"
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-300 hover:border-teal-300/40 hover:text-white"
-                    onClick={() =>
-                      queueEyeColor({
-                        hue: preset.hue,
-                        saturation: preset.saturation,
-                      })
-                    }
-                  >
-                    {preset.name}
-                  </button>
-                ))}
-                {VECTOR_PRESETS.filter(
-                  (p) => !EYE_COLOR_ENUM.some((e) => e.name === p.name),
-                ).map((preset) => (
                   <button
                     key={preset.name}
                     type="button"
@@ -409,77 +360,38 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 onClick={() => void pushEyeColor(hs)}
               >
                 {sending ? <Loader2 className="size-4 animate-spin" /> : null}
-                Apply color to Vector
+                Apply color
               </Button>
             </CardContent>
           </Card>
 
-          <div className="flex flex-col gap-6">
-            <Card className="bg-zinc-950/80">
-              <CardHeader>
-                <CardTitle>{info?.name ?? "Vector"}</CardTitle>
-                <CardDescription>
-                  PIN pairing opens BLE. The SDK guid unlocks eye color on the
-                  robot.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-4">
-                <VectorFace
-                  hue={hs.hue}
-                  saturation={hs.saturation}
-                  paired
-                />
-                <dl className="grid grid-cols-2 gap-3 text-sm">
-                  <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
-                  <Info label="IP" value={info?.ip ?? "—"} />
-                  <Info label="Serial" value={info?.esn ?? "—"} />
-                  <Info label="Build" value={info?.build ?? "—"} />
-                </dl>
-                {info && !info.wifiConnected ? (
-                  <p className="text-sm text-amber-200">
-                    He is paired over BLE but not on Wi-Fi. Put him on the same
-                    network as this device, then try again.
-                  </p>
-                ) : null}
-                <Button variant="outline" onClick={disconnect}>
-                  Disconnect
-                </Button>
-              </CardContent>
-            </Card>
-
-            <Card className="border-teal-500/20 bg-zinc-950/80">
-              <CardHeader>
-                <CardTitle>SDK guid (required)</CardTitle>
-                <CardDescription>
-                  From{" "}
-                  <code className="text-zinc-300">
-                    ~/.anki_vector/sdk_config.ini
-                  </code>
-                  , the <code className="text-zinc-300">guid=</code> line.
-                  WirePod users: use the client token from your WirePod SDK
-                  setup. Without this, Vector ignores eye-color commands.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3">
-                <Input
-                  value={guid}
-                  onChange={(event) => setGuid(event.target.value)}
-                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                  className="font-mono"
-                />
-                <Button
-                  variant="secondary"
-                  disabled={sending || !guid.trim() || demo}
-                  onClick={() => {
-                    storeSdkGuid(guid);
-                    void pushEyeColor(hs, guid);
-                  }}
-                >
-                  Save guid and Apply color
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
+          <Card className="bg-zinc-950/80">
+            <CardHeader>
+              <CardTitle>{info?.name ?? "Vector"}</CardTitle>
+              <CardDescription>
+                Stay on the same Wi-Fi. Color commands ride the BLE session
+                after the PIN.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              <VectorFace hue={hs.hue} saturation={hs.saturation} paired />
+              <dl className="grid grid-cols-2 gap-3 text-sm">
+                <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
+                <Info label="IP" value={info?.ip ?? "—"} />
+                <Info label="Serial" value={info?.esn ?? "—"} />
+                <Info label="Build" value={info?.build ?? "—"} />
+              </dl>
+              {info && !info.wifiConnected ? (
+                <p className="text-sm text-amber-200">
+                  Paired over BLE but not on Wi-Fi. Connect him to your network,
+                  then try again.
+                </p>
+              ) : null}
+              <Button variant="outline" onClick={disconnect}>
+                Disconnect
+              </Button>
+            </CardContent>
+          </Card>
         </div>
       ) : null}
     </div>

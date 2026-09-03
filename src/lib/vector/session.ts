@@ -8,7 +8,11 @@ import { RtsV4Handler } from "@/vendor/vector-rts/rtsV4Handler.js";
 import { RtsV5Handler } from "@/vendor/vector-rts/rtsV5Handler.js";
 import { RtsV6Handler } from "@/vendor/vector-rts/rtsV6Handler.js";
 
-// libsodium-wrappers is CommonJS; load after sodium.ready in connect().
+// Escape Pod / Wire-Pod shared session token used by wire-pod's BLE auth.
+// After backpack PIN pairing, this mints a clientTokenGuid on the robot with
+// no user-facing codes to paste.
+const ESCAPE_POD_SESSION_TOKEN = "2vMhFgktH3Jrbemm2WHkfGN";
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let sodium: any = null;
 
@@ -143,17 +147,6 @@ export function nearestEyeColorEnum(hue: number, saturation: number) {
     }
   }
   return best;
-}
-
-function describeSdkFailure(result: SdkResult) {
-  const body = (result.responseBody || "").trim();
-  if (result.statusCode === 401 || result.statusCode === 403) {
-    return "Vector rejected the SDK guid. Paste the guid= line from ~/.anki_vector/sdk_config.ini (or your WirePod token), then Apply again.";
-  }
-  if (result.statusCode === 0) {
-    return "Vector returned an empty SDK response. His BLE SDK proxy needs a valid client guid before eye color will stick.";
-  }
-  return `Vector returned HTTP ${result.statusCode} for ${result.path}${body ? `: ${body.slice(0, 180)}` : ""}`;
 }
 
 export class VectorSession {
@@ -322,7 +315,36 @@ export class VectorSession {
     this.handler.enterPin(cleaned);
     await paired;
     await this.refreshInfo();
+    await this.ensureSdkAuthorized();
     this.setPhase("paired");
+  }
+
+  /**
+   * After BLE PIN succeeds, mint an SDK client token the same way Wire-Pod
+   * does — Escape Pod session key over RtsCloudSession. No guid paste.
+   */
+  async ensureSdkAuthorized() {
+    if (!this.handler?.doAnkiAuth) {
+      throw new Error(
+        "This Vector firmware can’t authorize the SDK over BLE. Update to Escape Pod / Wire-Pod firmware.",
+      );
+    }
+    if (!this.handler.doSdk) {
+      throw new Error(
+        "This Vector firmware has no BLE SDK proxy. Update him, then pair again.",
+      );
+    }
+
+    const msg = await this.handler.doAnkiAuth(ESCAPE_POD_SESSION_TOKEN);
+    const value = msg.value;
+    if (!value?.success || !value.clientTokenGuid) {
+      throw new Error(
+        `Vector didn’t accept Escape Pod / Wire-Pod auth (status ${value?.statusCode ?? "?"}). He needs EP/Wire-Pod firmware — stock Anki cloud bots can’t mint a token from PIN alone.`,
+      );
+    }
+    this.clientGuid = value.clientTokenGuid;
+    storeSdkGuid(value.clientTokenGuid);
+    return value.clientTokenGuid;
   }
 
   async refreshInfo() {
@@ -353,36 +375,6 @@ export class VectorSession {
     return this.info;
   }
 
-  /**
-   * Authorize the BLE SDK proxy with an Anki/DDL/WirePod session token.
-   * On success, stores the returned clientTokenGuid for eye-color calls.
-   */
-  async authorizeCloud(sessionToken: string) {
-    if (!this.handler?.doAnkiAuth) {
-      throw new Error("This Vector firmware cannot run cloud auth over BLE.");
-    }
-    const token = sessionToken.trim();
-    if (!token) throw new Error("Paste a session token or SDK guid first.");
-
-    // If it already looks like a client guid, just store it.
-    if (token.length >= 16 && !token.includes(" ")) {
-      this.clientGuid = token;
-      storeSdkGuid(token);
-      return { guid: token, via: "guid" as const };
-    }
-
-    const msg = await this.handler.doAnkiAuth(token);
-    const value = msg.value;
-    if (!value.success || !value.clientTokenGuid) {
-      throw new Error(
-        `Cloud auth failed (status ${value.statusCode ?? "?"}). Use the guid= value from sdk_config.ini instead.`,
-      );
-    }
-    this.clientGuid = value.clientTokenGuid;
-    storeSdkGuid(value.clientTokenGuid);
-    return { guid: value.clientTokenGuid, via: "cloud" as const };
-  }
-
   private async sdkCall(
     guid: string,
     path: string,
@@ -393,16 +385,11 @@ export class VectorSession {
         "This Vector firmware cannot change eye color over BLE. Update him, then pair again.",
       );
     }
-    if (!guid.trim()) {
-      throw new Error(
-        "Missing SDK guid. Paste guid= from ~/.anki_vector/sdk_config.ini, then hit Apply.",
-      );
-    }
 
     let response: { value: SdkProxyValue };
     try {
       response = await this.handler.doSdk(
-        guid.trim(),
+        guid,
         RtsCliUtil.makeId(),
         path,
         JSON.stringify(body),
@@ -410,13 +397,24 @@ export class VectorSession {
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "SDK proxy request failed.";
-      // RtsResponse NotCloudAuthorized often lands here once waitForResponse is set.
       if (/not cloud authorized|unauthorized|timeout/i.test(message)) {
-        throw new Error(
-          "Vector says the SDK proxy is not authorized. Paste a valid guid from sdk_config.ini (or authorize with a WirePod/Anki session token).",
-        );
+        // One retry: re-auth with Escape Pod token then fail clearly.
+        try {
+          await this.ensureSdkAuthorized();
+          response = await this.handler.doSdk(
+            this.clientGuid,
+            RtsCliUtil.makeId(),
+            path,
+            JSON.stringify(body),
+          );
+        } catch {
+          throw new Error(
+            "Vector’s SDK proxy is not authorized. Pair again after he’s on Escape Pod / Wire-Pod firmware.",
+          );
+        }
+      } else {
+        throw err instanceof Error ? err : new Error(message);
       }
-      throw err instanceof Error ? err : new Error(message);
     }
 
     return {
@@ -427,42 +425,60 @@ export class VectorSession {
     };
   }
 
-  async setEyeColor(hue: number, saturation: number, guidOverride?: string) {
-    const guid = (guidOverride ?? this.clientGuid ?? getStoredSdkGuid()).trim();
-    if (!guid) {
-      throw new Error(
-        "Eye color needs your SDK guid. Pairing alone is not enough — paste guid= from ~/.anki_vector/sdk_config.ini below, then Apply.",
-      );
+  async setEyeColor(hue: number, saturation: number) {
+    if (!this.clientGuid) {
+      await this.ensureSdkAuthorized();
     }
-    this.clientGuid = guid;
-    storeSdkGuid(guid);
+    const guid = this.clientGuid || getStoredSdkGuid();
+    if (!guid) {
+      throw new Error("Could not authorize Vector for eye color. Pair again.");
+    }
 
-    // 1) Temporary RGB via SDK (what the Python SDK uses).
+    // Same payload Wire-Pod uses — permanent custom RGB via settings jdoc.
+    const custom = await this.sdkCall(guid, "/v1/update_settings", {
+      update_settings: true,
+      settings: {
+        custom_eye_color: {
+          enabled: true,
+          hue,
+          saturation,
+        },
+      },
+    });
+
+    if (custom.statusCode === 200) {
+      // Also nudge live face color immediately.
+      try {
+        await this.sdkCall(guid, "/v1/set_eye_color", { hue, saturation });
+      } catch {
+        // Permanent settings write is enough.
+      }
+      return custom;
+    }
+
+    // Fallback: temporary SDK eye color + nearest permanent enum preset.
     const rgb = await this.sdkCall(guid, "/v1/set_eye_color", {
       hue,
       saturation,
     });
     if (rgb.statusCode !== 200) {
-      throw Object.assign(new Error(describeSdkFailure(rgb)), { sdk: rgb });
+      throw new Error(
+        `Vector returned ${custom.statusCode} for custom color and ${rgb.statusCode} for set_eye_color.`,
+      );
     }
 
-    // 2) Also push the nearest permanent preset so idle behavior doesn't snap back.
     const preset = nearestEyeColorEnum(hue, saturation);
     try {
-      const settings = await this.sdkCall(guid, "/v1/update_settings", {
-        settings: { eye_color: preset.enum },
+      await this.sdkCall(guid, "/v1/update_settings", {
+        update_settings: true,
+        settings: {
+          custom_eye_color: { enabled: false },
+          eye_color: preset.value,
+        },
       });
-      if (settings.statusCode !== 200) {
-        // Non-fatal: RGB call already succeeded.
-        return {
-          ...rgb,
-          responseBody: `${rgb.responseBody || ""} | preset ${preset.name} status ${settings.statusCode}`,
-        };
-      }
     } catch {
-      // Ignore preset failure if RGB worked.
+      // ignore
     }
-
     return rgb;
   }
 

@@ -1,6 +1,6 @@
 # Vector Eye Color
 
-A site for a real [Anki Vector](https://www.digitaldreamlabs.com/) that pairs the same way the companion app does, then lets you paint his eyes from an RGB wheel.
+A site for a real [Anki Vector](https://www.digitaldreamlabs.com/) that pairs over Bluetooth, then lets you paint his eyes from an RGB wheel.
 
 It is a static Next.js app. Deploy it on Vercel. Pairing and eye-color commands run in the browser — Vercel never talks to your robot.
 
@@ -10,8 +10,8 @@ It is a static Next.js app. Deploy it on Vercel. Pairing and eye-color commands 
 2. Put Vector on his charger.
 3. Double-click the backpack button — the raised key on his LED strip. He shows a key icon and a 6-digit PIN.
 4. Click **Find Vector** and pick the BLE device whose name matches that PIN (or `Vector XXXX`).
-5. Type the PIN. If it checks out, the RGB wheel unlocks.
-6. Stay on the **same Wi-Fi** as Vector. After pairing, eye color is sent over the BLE SDK proxy (`/v1/set_eye_color`).
+5. Type the PIN. The site authorizes the SDK tunnel automatically (Escape Pod / Wire-Pod style). No guid to paste.
+6. Drag the RGB wheel. Stay on the **same Wi-Fi** as Vector.
 
 ## Deploy on Vercel
 
@@ -38,20 +38,17 @@ Open [http://127.0.0.1:43147](http://127.0.0.1:43147). Localhost counts as a sec
 
 `/?demo=1` opens the wheel without a robot, so you can check the UI.
 
-## If eye color does nothing after a good PIN
+## How eye color auth works
 
-The backpack PIN only opens the BLE tunnel. Eye color rides Vector’s **SDK proxy**, which requires the client `guid` from:
+After the backpack PIN succeeds, the site runs Escape Pod / Wire-Pod cloud auth over BLE (same fixed session token Wire-Pod uses) and stores the minted client token locally. You do **not** paste a guid.
 
-```ini
-# ~/.anki_vector/sdk_config.ini
-guid = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+Eye color is written with:
+
+```json
+{"update_settings": true, "settings": {"custom_eye_color": {"enabled": true, "hue": 0.42, "saturation": 1.0}}}
 ```
 
-Paste that into the **SDK guid** field on the paired screen, then hit **Apply color**.
-
-WirePod: use the client token from your WirePod / SDK configure step.
-
-Factory RTS v2/v3 robots have no BLE SDK proxy. Update Vector first.
+That matches Wire-Pod’s SDK app. Stock Anki-cloud-only robots without EP/Wire-Pod firmware can’t mint that token from PIN alone.
 
 ## Stack
 

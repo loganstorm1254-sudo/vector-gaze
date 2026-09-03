@@ -576,6 +576,7 @@ class RtsV3Handler {
 
   doAnkiAuth(sessionToken) {
     let self = this;
+    self.waitForResponse = "anki-auth";
     let p = new Promise(function (resolve, reject) {
       self.storePromiseMethods("anki-auth", resolve, reject);
       self.send(
@@ -585,7 +586,10 @@ class RtsV3Handler {
       );
     });
 
-    return p;
+    let timeout = new Promise(function (_resolve, reject) {
+      setTimeout(function () { reject(new Error("Cloud auth timed out")); }, 20000);
+    });
+    return Promise.race([p, timeout]);
   }
 
   doOtaStart(url) {
