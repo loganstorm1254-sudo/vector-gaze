@@ -40,13 +40,15 @@ When Chrome asks **“Allow this site to access your local network?”** — cli
 
 ### Custom overlay image
 
-Built-in flavors (Lesbian → Galaxy) are already on the robot. **Custom** loads `/data/data/customFaceOverlay.jpg` (184×96). Pick an image in the app — it resizes to that size and tries to push it. Stock WireOS blocks HTTP PUT to the filesystem, so if upload fails the app downloads the prepared JPG; SCP it once:
+Built-in flavors (Lesbian → Galaxy) are already on the robot. **Custom** loads `/data/data/customFaceOverlay.jpg` (184×96).
+
+When you pick a new image, the app **wipes the old custom overlay first**, then overwrites that JPG and runs `LOOK_LoadFaceOverlay`. Enter your robot **SSH password** in the UI (or set `VECTOR_SSH_PASSWORD` for local `npm run dev`) so it can `rm` + `scp` the new file. Stock WireOS blocks HTTP PUT to the filesystem.
+
+If write still fails, the app downloads the prepared JPG — copy it yourself, then Apply:
 
 ```bash
 scp customFaceOverlay.jpg root@VECTOR_IP:/data/data/
 ```
-
-Then tap **Custom** / **Apply overlay** again. Optional local-dev shortcut: set `VECTOR_SSH_PASSWORD` (and optional `VECTOR_SSH_USER`) so the Next API can SCP for you when you run `npm run dev` on the same LAN.
 
 ## Run locally (optional)
 

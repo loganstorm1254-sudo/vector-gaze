@@ -185,15 +185,51 @@ function run(cmd: string, args: string[], env?: NodeJS.ProcessEnv) {
   );
 }
 
-/** Optional local-dev SCP when VECTOR_SSH_PASSWORD is set. */
-async function uploadOverlayJpeg(ip: string, jpegBase64: string) {
-  const password = process.env.VECTOR_SSH_PASSWORD?.trim();
+/** Optional local-dev SCP when VECTOR_SSH_PASSWORD or request password is set. */
+async function uploadOverlayJpeg(
+  ip: string,
+  jpegBase64: string,
+  sshPassword?: string,
+) {
+  const password =
+    sshPassword?.trim() || process.env.VECTOR_SSH_PASSWORD?.trim() || "";
   if (!password) {
+    // Try HTTP PUT from this Node process (same LAN when running npm run dev).
+    const bytes = Buffer.from(jpegBase64, "base64");
+    let putOk = false;
+    let tried = 0;
+    const paths = [
+      "/persistent/../../customFaceOverlay.jpg",
+      "/cache/../../customFaceOverlay.jpg",
+      "/resources/../../../../data/data/customFaceOverlay.jpg",
+      "/customFaceOverlay.jpg",
+    ];
+    for (const port of ANIM_PORTS) {
+      for (const path of paths) {
+        const url = `http://${ip}:${port}${path}`;
+        tried += 1;
+        await hit(url, { method: "DELETE" });
+        tried += 1;
+        if (
+          await hit(url, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "image/jpeg",
+              "Content-Length": String(bytes.length),
+            },
+            body: bytes,
+          })
+        ) {
+          putOk = true;
+        }
+      }
+    }
+    if (putOk) return { ok: true, tried, via: "http-put" as const };
     return {
       ok: false,
-      tried: 0,
+      tried,
       error:
-        "No VECTOR_SSH_PASSWORD in the local env. Browser PUT is attempted separately; or SCP customFaceOverlay.jpg to /data/data/ on the robot.",
+        "No SSH password and HTTP PUT to the robot failed. Enter SSH password or SCP customFaceOverlay.jpg to /data/data/.",
     };
   }
 
@@ -201,20 +237,32 @@ async function uploadOverlayJpeg(ip: string, jpegBase64: string) {
   const tmp = join(tmpdir(), `customFaceOverlay-${Date.now()}.jpg`);
   try {
     await writeFile(tmp, Buffer.from(jpegBase64, "base64"));
-    const scp = await run(
+    // Remove old file first so the new image fully replaces it.
+    await run(
       "sshpass",
       [
         "-p",
         password,
-        "scp",
+        "ssh",
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
-        tmp,
-        `${user}@${ip}:/data/data/customFaceOverlay.jpg`,
+        `${user}@${ip}`,
+        "rm -f /data/data/customFaceOverlay.jpg",
       ],
     );
+    const scp = await run("sshpass", [
+      "-p",
+      password,
+      "scp",
+      "-o",
+      "StrictHostKeyChecking=no",
+      "-o",
+      "UserKnownHostsFile=/dev/null",
+      tmp,
+      `${user}@${ip}:/data/data/customFaceOverlay.jpg`,
+    ]);
     if (scp.code === 0) {
       return { ok: true, tried: 1, via: "scp" as const };
     }
@@ -238,6 +286,7 @@ export async function POST(request: Request) {
     flavor?: number | null;
     opacity?: number;
     jpegBase64?: string;
+    sshPassword?: string;
   };
   try {
     body = await request.json();
@@ -300,7 +349,11 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    const result = await uploadOverlayJpeg(ip, jpegBase64);
+    const result = await uploadOverlayJpeg(
+      ip,
+      jpegBase64,
+      typeof body.sshPassword === "string" ? body.sshPassword : undefined,
+    );
     return NextResponse.json({ ip, action, ...result });
   }
 

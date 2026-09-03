@@ -62,6 +62,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
   const [volume, setVolume] = useState<VolumeLevel>(3);
   const [overlayId, setOverlayId] = useState<FaceOverlayId>("off");
   const [overlayOpacity, setOverlayOpacity] = useState(0.8);
+  const [sshPassword, setSshPassword] = useState("");
   const [customPreview, setCustomPreview] = useState<PreparedOverlayJpeg | null>(
     null,
   );
@@ -238,6 +239,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     id: FaceOverlayId,
     opacity = overlayOpacity,
     prepared: PreparedOverlayJpeg | null = customPreview,
+    opts: { replaceCustom?: boolean } = {},
   ) {
     const session = sessionRef.current;
     const entry = FACE_OVERLAYS.find((item) => item.id === id);
@@ -250,42 +252,58 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     }
     if (!session) return;
 
+    const replaceCustom = opts.replaceCustom ?? id === "custom";
+
     setSending(true);
     setOverlayId(id);
+    setError(null);
     setLastSent(
-      id === "custom"
-        ? "Loading custom overlay…"
-        : id === "off"
-          ? "Turning overlay off…"
-          : `Loading ${entry.name} overlay…`,
+      id === "custom" && replaceCustom
+        ? "Wiping old custom overlay and writing the new image…"
+        : id === "custom"
+          ? "Loading custom overlay from the robot…"
+          : id === "off"
+            ? "Turning overlay off…"
+            : `Loading ${entry.name} overlay…`,
     );
 
     try {
-      if (id === "custom") {
+      if (id === "custom" && replaceCustom) {
         if (!prepared) {
-          throw new Error("Pick a custom image first (184×96 JPEG on the robot).");
+          throw new Error("Pick a custom image first.");
         }
-        const uploaded = await session.uploadCustomOverlay(prepared.blob);
-        if (!uploaded) {
-          downloadOverlayJpeg(prepared.blob);
-          setError(
-            `Couldn’t write customFaceOverlay.jpg over HTTP (stock WireOS blocks PUT). Downloaded the 184×96 JPG — SCP it once: scp customFaceOverlay.jpg root@${session.info?.ip ?? "VECTOR_IP"}:/data/data/ then tap Custom again.`,
+        try {
+          await session.replaceCustomOverlay(
+            prepared.blob,
+            opacity,
+            sshPassword || undefined,
           );
-        } else {
-          setError(null);
+          setLastSent(
+            "Old custom wiped — new image written and loaded on his face.",
+          );
+        } catch (uploadErr) {
+          // Stay wiped. Reloading Custom here would bring the OLD file back.
+          downloadOverlayJpeg(prepared.blob);
+          setOverlayId("off");
+          const detail =
+            uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
+          setError(detail);
+          setLastSent(
+            "Old custom wiped from his face. New JPG downloaded — SCP it to /data/data/customFaceOverlay.jpg, then tap Custom and Apply overlay.",
+          );
         }
+      } else {
+        await session.setEyeOverlay(entry.flavor, opacity);
+        setLastSent(
+          id === "off"
+            ? "Eye overlay off."
+            : `${entry.name} overlay loaded via Face console — no servers.`,
+        );
       }
-
-      await session.setEyeOverlay(entry.flavor, opacity);
-      setLastSent(
-        id === "off"
-          ? "Eye overlay off."
-          : `${entry.name} overlay loaded via Face console — no servers.`,
-      );
-      if (id !== "custom") setError(null);
       setInfo(session.info);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not set overlay.");
+      const message = err instanceof Error ? err.message : "Could not set overlay.";
+      setError(message);
       setLastSent(null);
     } finally {
       setSending(false);
@@ -303,7 +321,9 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
         setLastSent("Preview only — connect a real Vector to push this overlay.");
         return;
       }
-      await pushOverlay("custom", overlayOpacity, prepared);
+      await pushOverlay("custom", overlayOpacity, prepared, {
+        replaceCustom: true,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not read that image.");
     }
@@ -620,12 +640,9 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                       type="button"
                       disabled={sending}
                       onClick={() => {
+                        // Always re-pick for Custom so the new image replaces the old one.
                         if (entry.id === "custom") {
-                          if (customPreview) {
-                            void pushOverlay("custom");
-                          } else {
-                            fileInputRef.current?.click();
-                          }
+                          fileInputRef.current?.click();
                           return;
                         }
                         void pushOverlay(entry.id);
@@ -682,14 +699,35 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                       setOverlayOpacity(next);
                     }}
                     onPointerUp={() => {
-                      if (overlayId !== "off") {
+                      if (overlayId !== "off" && overlayId !== "custom") {
                         void pushOverlay(overlayId, overlayOpacity);
+                      } else if (overlayId === "custom" && customPreview) {
+                        void pushOverlay("custom", overlayOpacity, customPreview);
                       }
                     }}
                     className="w-full accent-teal-400"
                   />
                 </label>
               </div>
+
+              <label className="flex flex-col gap-1 text-sm text-zinc-300">
+                <span className="text-xs tracking-wide text-zinc-500 uppercase">
+                  Robot SSH password (for replacing custom JPG)
+                </span>
+                <Input
+                  type="password"
+                  autoComplete="off"
+                  placeholder="root password — overwrites /data/data/customFaceOverlay.jpg"
+                  value={sshPassword}
+                  onChange={(event) => setSshPassword(event.target.value)}
+                  className="max-w-md bg-zinc-900"
+                />
+                <span className="text-xs text-zinc-500">
+                  Lets Custom wipe the old file and write yours. Use with local{" "}
+                  <code className="text-zinc-400">npm run dev</code> on the same
+                  Wi-Fi. Kept only in this page session.
+                </span>
+              </label>
 
               <input
                 ref={fileInputRef}
@@ -716,7 +754,12 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                   type="button"
                   className="bg-teal-400 text-zinc-950 hover:bg-teal-300"
                   disabled={sending || demo || overlayId === "off"}
-                  onClick={() => void pushOverlay(overlayId)}
+                  onClick={() =>
+                    void pushOverlay(overlayId, overlayOpacity, customPreview, {
+                      // Apply reloads from robot disk (after SCP) without requiring rewrite.
+                      replaceCustom: false,
+                    })
+                  }
                 >
                   {sending ? <Loader2 className="size-4 animate-spin" /> : null}
                   Apply overlay
