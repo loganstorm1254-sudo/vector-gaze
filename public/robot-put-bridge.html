@@ -35,7 +35,7 @@
           });
           reply({
             type: "vector-gaze-put-result",
-            ok: res.ok || (res.status > 0 && res.status < 500),
+            ok: res.ok || res.status === 201,
             status: res.status,
           });
         } catch (err) {

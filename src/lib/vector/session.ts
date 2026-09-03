@@ -511,6 +511,13 @@ export type CustomUploadResult = {
   via: "unlock-ssh" | "http-resources" | "http-bridge";
 };
 
+export {
+  RobotWriteSetupError,
+  beginRobotWriteSetup,
+  buildRobotWriteSetupScript,
+  isRobotWriteSetupError,
+} from "@/lib/vector/robot-write-setup";
+
 async function blobToBase64(jpeg: Blob): Promise<string> {
   const buf = new Uint8Array(await jpeg.arrayBuffer());
   let binary = "";
@@ -669,7 +676,7 @@ async function putRobotJpegVerified(
     }
     try {
       const res = await fetch(url, localInit);
-      if (!(res.ok || (res.status > 0 && res.status < 500))) continue;
+      if (!(res.ok || res.status === 201)) continue;
     } catch {
       continue;
     }
@@ -680,6 +687,19 @@ async function putRobotJpegVerified(
     if (got === expected) return true;
   }
   return false;
+}
+
+/** True when the robot-origin put-bridge HTML is already installed. */
+export async function robotPutBridgeInstalled(ip: string): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+  const bytes = await getRobotBytes(ip, PUT_BRIDGE_URI);
+  if (!bytes || bytes.byteLength < 32) return false;
+  try {
+    const text = new TextDecoder().decode(bytes);
+    return text.includes("vector-gaze-put");
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1067,14 +1087,18 @@ export class VectorSession {
   }
 
   /**
-   * Wipe any current custom overlay, push the new JPG automatically, then load it.
-   * No SSH password / SCP — uses unlock-key SSH (local) or verified HTTP staging (Vercel).
-   * On write failure the face stays wiped — we never reload the previous Custom file.
+   * Push the new JPG automatically, then switch the face to it (replacing whatever
+   * was showing). No SSH password / SCP — unlock-key SSH (local) or HTTP staging.
+   * Does not wipe first: if the write fails, the previous face stays put.
    */
   async replaceCustomOverlay(
     jpeg: Blob,
     opacity = 0.8,
   ): Promise<SdkResult> {
+    const { RobotWriteSetupError, buildRobotWriteSetupScript } = await import(
+      "@/lib/vector/robot-write-setup"
+    );
+
     await this.refreshInfo();
     const ip = this.info?.ip;
     if (!ip) {
@@ -1083,20 +1107,18 @@ export class VectorSession {
       );
     }
 
-    // 1) Wipe whatever is currently showing (CustomEyes=false). Do NOT call
-    // LOOK_LoadFaceOverlay here — that would reload the OLD Custom file from disk.
-    await setEyeOverlayViaConsole(ip, null, opacity);
-    await new Promise((r) => setTimeout(r, 100));
-
-    // 2) Write the new image (verified). Fail closed — stay wiped.
+    // 1) Write the new image first (verified). Keep the old face if this fails.
     const uploaded = await uploadCustomOverlayJpeg(ip, jpeg);
     if (!uploaded) {
-      throw new Error(
-        `Wiped the old overlay, but couldn’t write the new image to ${ip}. Stay on the same Wi-Fi, click Allow for local network access, and try again.`,
+      const jpegBase64 = await blobToBase64(jpeg);
+      throw new RobotWriteSetupError(
+        ip,
+        buildRobotWriteSetupScript(jpegBase64, opacity),
       );
     }
 
-    // 3) Load only the flavor that matches the verified write target.
+    // 2) Load only the flavor that matches the verified write target.
+    // Switching CustomEyes off→on (or flavor change) replaces the previous overlay.
     const ok = await setEyeOverlayViaConsole(ip, uploaded.flavor, opacity);
     if (!ok) {
       throw new Error(

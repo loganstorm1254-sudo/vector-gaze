@@ -24,9 +24,11 @@ import {
   type PreparedOverlayJpeg,
 } from "@/lib/vector/overlay";
 import {
+  beginRobotWriteSetup,
   bluetoothSupported,
   ensureLocalNetworkAccess,
   EYE_COLOR_ENUM,
+  isRobotWriteSetupError,
   VOLUME_LEVELS,
   VectorSession,
   type PairPhase,
@@ -36,6 +38,13 @@ import {
 
 type UiPhase = "landing" | "pin" | "eyes";
 
+type WriteSetupState = {
+  ip: string;
+  setupScript: string;
+  robotPageUrl: string;
+  copied: boolean;
+};
+
 export function VectorApp({ demo = false }: { demo?: boolean }) {
   const sessionRef = useRef<VectorSession | null>(null);
   const [phase, setPhase] = useState<UiPhase>("landing");
@@ -44,6 +53,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [writeSetup, setWriteSetup] = useState<WriteSetupState | null>(null);
   const [info, setInfo] = useState<VectorInfo | null>(
     demo
       ? {
@@ -256,9 +266,10 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     setSending(true);
     setOverlayId(id);
     setError(null);
+    setWriteSetup(null);
     setLastSent(
       id === "custom" && replaceCustom
-        ? "Wiping old custom overlay and writing the new image…"
+        ? "Writing the new custom overlay to Vector…"
         : id === "custom"
           ? "Loading custom overlay from the robot…"
           : id === "off"
@@ -272,9 +283,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           throw new Error("Pick a custom image first.");
         }
         await session.replaceCustomOverlay(prepared.blob, opacity);
-        setLastSent(
-          "Old custom wiped — new image written and loaded on his face.",
-        );
+        setLastSent("New custom overlay written and loaded on his face.");
       } else if (id === "custom") {
         await session.reloadCustomOverlay(opacity, prepared?.blob);
         setLastSent("Custom overlay rewritten and loaded.");
@@ -290,13 +299,48 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
         );
       }
       setInfo(session.info);
+      setWriteSetup(null);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Could not set overlay.";
-      setError(message);
-      setLastSent(null);
+      if (isRobotWriteSetupError(err)) {
+        const started = await beginRobotWriteSetup(err.ip, err.setupScript);
+        setWriteSetup({
+          ip: err.ip,
+          setupScript: err.setupScript,
+          robotPageUrl: started.robotPageUrl,
+          copied: started.copied,
+        });
+        setError(null);
+        setLastSent(null);
+      } else {
+        const message =
+          err instanceof Error ? err.message : "Could not set overlay.";
+        setError(message);
+        setLastSent(null);
+      }
     } finally {
       setSending(false);
     }
+  }
+
+  async function runWriteSetupAgain() {
+    if (!writeSetup) return;
+    const started = await beginRobotWriteSetup(
+      writeSetup.ip,
+      writeSetup.setupScript,
+    );
+    setWriteSetup({
+      ...writeSetup,
+      copied: started.copied,
+      robotPageUrl: started.robotPageUrl,
+    });
+  }
+
+  async function retryCustomAfterSetup() {
+    if (!customPreview) return;
+    setWriteSetup(null);
+    await pushOverlay("custom", overlayOpacity, customPreview, {
+      replaceCustom: true,
+    });
   }
 
   async function onPickCustomImage(file: File | null) {
@@ -328,6 +372,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     setError(null);
     setOverlayId("off");
     setCustomPreview(null);
+    setWriteSetup(null);
   }
 
   return (
@@ -357,6 +402,60 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       {error ? (
         <div className="rounded-xl border border-red-500/30 bg-red-950/40 px-4 py-3 text-sm text-red-100">
           {error}
+        </div>
+      ) : null}
+
+      {writeSetup ? (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-950/40 px-4 py-4 text-sm text-amber-50">
+          <p className="font-medium text-amber-100">
+            One-time write setup for {writeSetup.ip}
+          </p>
+          <p className="mt-2 text-amber-100/85">
+            Chrome blocks websites from writing files straight to Vector’s eng
+            console. Paste the setup command on Vector’s own page once — then
+            custom overlays from this site are automatic.
+          </p>
+          <ol className="mt-3 list-decimal space-y-1 pl-5 text-amber-100/90">
+            <li>
+              Vector’s page should be open at{" "}
+              <a
+                className="underline decoration-amber-300/50 underline-offset-2"
+                href={writeSetup.robotPageUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {writeSetup.robotPageUrl}
+              </a>
+              {writeSetup.copied ? " (command already copied)." : "."}
+            </li>
+            <li>
+              On that page press <span className="font-mono">F12</span> (or{" "}
+              <span className="font-mono">⌘⌥J</span>), open Console, paste,
+              Enter.
+            </li>
+            <li>Come back here and hit Retry.</li>
+          </ol>
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+            <Button
+              type="button"
+              variant="secondary"
+              className="bg-amber-200 text-zinc-950 hover:bg-amber-100"
+              onClick={() => void runWriteSetupAgain()}
+            >
+              Open Vector page &amp; copy command
+            </Button>
+            <Button
+              type="button"
+              className="bg-teal-400 text-zinc-950 hover:bg-teal-300"
+              disabled={sending || !customPreview}
+              onClick={() => void retryCustomAfterSetup()}
+            >
+              {sending ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : null}
+              Retry custom overlay
+            </Button>
+          </div>
         </div>
       ) : null}
 
@@ -612,8 +711,10 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 <code className="text-teal-200/90">ProcFace_CustomEyes</code>,
                 pick a flavor, then{" "}
                 <code className="text-teal-200/90">LOOK_LoadFaceOverlay</code>.
-                Custom uploads your image from this page automatically
-                (184×96) — no SCP.
+                Custom uploads from this page (184×96). On Vercel the first
+                image may need a one-time paste on Vector’s{" "}
+                <span className="font-mono">:8889</span> page; after that it’s
+                automatic — no SCP.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-5">

@@ -40,10 +40,10 @@ When Chrome asks **“Allow this site to access your local network?”** — cli
 
 ### Custom overlay image
 
-Built-in flavors (Lesbian → Galaxy) are already on the robot. Pick **Custom**, choose any image — the site resizes it to 184×96, wipes the previous custom overlay, writes the new JPG to Vector over your LAN, and runs `LOOK_LoadFaceOverlay`. No SSH password. No SCP.
+Built-in flavors (Lesbian → Galaxy) are already on the robot. Pick **Custom**, choose any image — the site resizes it to 184×96, writes the JPG to Vector over your LAN, and runs `LOOK_LoadFaceOverlay`. No SSH password. No SCP.
 
 - **Local `npm run dev`** (same Wi-Fi): uses the public unlocked-Vector root key over SSH to write `/data/data/customFaceOverlay.jpg`.
-- **Vercel / remote host**: the browser PUTs the image into the eng-console `/resources` face-overlay slot and loads it (Chrome Local Network Access required).
+- **Vercel / remote host**: Chrome cannot PUT files cross-origin to the eng console (CORS preflight). The first custom image shows a **one-time setup**: open `http://<vector-ip>:8889/`, paste the copied command into that page’s Console, Enter. That writes the image and installs a tiny put-bridge on the robot. Later custom images from this site use the bridge automatically (iframe same-origin PUT). Click **Allow** for local network access.
 ## Run locally (optional)
 
 ```bash
