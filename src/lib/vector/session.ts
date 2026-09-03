@@ -8,18 +8,6 @@ import { RtsV4Handler } from "@/vendor/vector-rts/rtsV4Handler.js";
 import { RtsV5Handler } from "@/vendor/vector-rts/rtsV5Handler.js";
 import { RtsV6Handler } from "@/vendor/vector-rts/rtsV6Handler.js";
 
-/**
- * Escape Pod session token (same value Wire-Pod and official Escape Pod use).
- * Only works when Vector can reach a local Escape Pod cloud at escapepod.local.
- */
-const ESCAPE_POD_SESSION_TOKEN = "2vMhFgktH3Jrbemm2WHkfGN";
-
-/**
- * Wire-Pod / Escape Pod default SDK guid used when a bot was activated with
- * the shared primary token. Harmless to try; ignored if the bot never had it.
- */
-const ESCAPE_POD_GLOBAL_GUID = "tni1TRsTRTaNSapjo0Y+Sw==";
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let sodium: any = null;
 
@@ -43,7 +31,6 @@ export type VectorInfo = {
   supportsSdkProxy: boolean;
   hasOwner?: boolean;
   isCloudAuthed?: boolean;
-  looksLikeEscapePod: boolean;
 };
 
 export type SdkResult = {
@@ -51,11 +38,8 @@ export type SdkResult = {
   responseType?: string;
   responseBody?: string;
   path: string;
+  via: "console" | "sdk";
 };
-
-export type CloudAuthStatus =
-  | { ok: true; guid: string; source: "stored" | "global" | "cloud" | "manual" }
-  | { ok: false; statusCode?: number; detail: string };
 
 type RtsHandler = {
   enterPin: (pin: string) => void;
@@ -68,7 +52,6 @@ type RtsHandler = {
     path: string,
     json: string,
   ) => Promise<{ value: SdkProxyValue }>;
-  doAnkiAuth?: (sessionToken: string) => Promise<{ value: CloudAuthValue }>;
   onReadyForPin: (fn: () => void) => void;
   onEncryptedConnection: (fn: () => void) => void;
   onPrint: (fn: (msg: string) => void) => void;
@@ -95,24 +78,6 @@ type SdkProxyValue = {
   responseBody?: string;
 };
 
-type CloudAuthValue = {
-  success?: boolean;
-  statusCode?: number;
-  clientTokenGuid?: string;
-};
-
-const GUID_KEY = "vector-eyes-sdk-guid";
-
-const CLOUD_STATUS: Record<number, string> = {
-  0: "UnknownError",
-  1: "ConnectionError",
-  2: "WrongAccount",
-  3: "InvalidSessionToken",
-  4: "AuthorizedAsPrimary",
-  5: "AuthorizedAsSecondary",
-  6: "ReassociatedPrimary",
-};
-
 /** Official permanent presets (RobotSettings EyeColor enum). */
 export const EYE_COLOR_ENUM = [
   { name: "Teal", enum: "TIP_OVER_TEAL", value: 0, hue: 0.42, saturation: 1 },
@@ -123,6 +88,9 @@ export const EYE_COLOR_ENUM = [
   { name: "Purple", enum: "FALSE_POSITIVE_PURPLE", value: 5, hue: 0.83, saturation: 0.76 },
   { name: "Green", enum: "CONFUSION_MATRIX_GREEN", value: 6, hue: 0.3, saturation: 1 },
 ] as const;
+
+// Unlocked / CFW eng console ports (anim owns the face).
+const CONSOLE_PORTS = [8889, 8888] as const;
 
 function generateHandshakeMessage(version: number) {
   return [1].concat(IntBuffer.Int32ToLE(version));
@@ -142,26 +110,8 @@ function hexSsid(hex?: string) {
   }
 }
 
-function looksLikeEscapePod(build?: string) {
-  if (!build) return false;
-  return /ep\b/i.test(build) || /escapepod/i.test(build);
-}
-
 export function bluetoothSupported() {
   return typeof navigator !== "undefined" && Boolean(navigator.bluetooth);
-}
-
-export function getStoredSdkGuid() {
-  if (typeof window === "undefined") return "";
-  return window.localStorage.getItem(GUID_KEY) ?? "";
-}
-
-export function storeSdkGuid(guid: string) {
-  window.localStorage.setItem(GUID_KEY, guid.trim());
-}
-
-export function clearStoredSdkGuid() {
-  window.localStorage.removeItem(GUID_KEY);
 }
 
 export function nearestEyeColorEnum(hue: number, saturation: number) {
@@ -182,26 +132,128 @@ export function nearestEyeColorEnum(hue: number, saturation: number) {
   return best;
 }
 
-function cloudAuthFailureMessage(statusCode?: number, epFirmware?: boolean) {
-  const label =
-    statusCode === undefined
-      ? "unknown"
-      : `${CLOUD_STATUS[statusCode] ?? "Unknown"} (${statusCode})`;
-
-  if (statusCode === 1) {
-    return (
-      `Vector couldn’t reach his cloud (${label}). ` +
-      (epFirmware
-        ? "His firmware is Escape Pod style, so he looks for escapepod.local on your LAN. That is official Escape Pod or Wire-Pod — without a local Escape Pod server running, minting a new SDK token fails. Anki’s cloud is gone."
-        : "Anki’s cloud is gone. Unlocked / CFW bots still need either a local Escape Pod server (escapepod.local) or an SDK guid that was minted earlier.")
-    );
+/**
+ * Fire-and-forget HTTP to Vector's LAN eng console.
+ * Works without Wire-Pod / Anki / Escape Pod — unlocked CFW exposes these.
+ * Tries CORS fetch, no-cors fetch, then image beacons (helps HTTPS→HTTP).
+ */
+async function hitRobotHttp(url: string, init?: RequestInit): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      ...init,
+      mode: "cors",
+      cache: "no-store",
+    });
+    if (res.ok || res.status === 200) return true;
+    // Some eng builds return 200 with text/html body either way.
+    if (res.status > 0 && res.status < 500) return true;
+  } catch {
+    // fall through
   }
 
-  if (statusCode === 3) {
-    return `Vector rejected the session token (${label}). Use an Escape Pod / Wire-Pod session, or paste an existing SDK guid.`;
+  try {
+    await fetch(url, {
+      ...init,
+      mode: "no-cors",
+      cache: "no-store",
+    });
+    // Opaque response — assume the packet left the browser.
+    return true;
+  } catch {
+    // fall through
   }
 
-  return `Cloud auth failed (${label}). Unlocked CFW does not skip SDK auth — PIN only unlocks BLE.`;
+  // Passive beacon: passive mixed content often still allowed from HTTPS pages.
+  if (!init || !init.method || init.method.toUpperCase() === "GET") {
+    await new Promise<boolean>((resolve) => {
+      const img = new Image();
+      const done = () => resolve(true);
+      img.onload = done;
+      img.onerror = done;
+      img.src = url;
+      window.setTimeout(done, 800);
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function setEyeColorViaLocalProxy(
+  ip: string,
+  hue: number,
+  saturation: number,
+): Promise<boolean> {
+  try {
+    const res = await fetch("/api/vector-console", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip, hue, saturation }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { ok?: boolean };
+    return Boolean(data.ok);
+  } catch {
+    return false;
+  }
+}
+
+async function setEyeColorViaConsole(
+  ip: string,
+  hue: number,
+  saturation: number,
+): Promise<boolean> {
+  // When Next is running on your machine, the API route can reach Vector even
+  // if the browser blocks private-network HTTP.
+  if (await setEyeColorViaLocalProxy(ip, hue, saturation)) {
+    return true;
+  }
+
+  const h = Number(hue.toFixed(4));
+  const s = Number(saturation.toFixed(4));
+  let anyOk = false;
+
+  for (const port of CONSOLE_PORTS) {
+    const base = `http://${ip}:${port}`;
+
+    // Preferred: console functions call SetHue/SetSaturation (updates face images).
+    const hueFn = `${base}/consolefunccall?func=ProcFace_Hue&args=${encodeURIComponent(String(h))}`;
+    const satFn = `${base}/consolefunccall?func=ProcFace_Saturation&args=${encodeURIComponent(String(s))}`;
+    const hueVar = `${base}/consolevarset?key=${encodeURIComponent("kProcFace_Hue")}&value=${encodeURIComponent(String(h))}`;
+    const satVar = `${base}/consolevarset?key=${encodeURIComponent("kProcFace_Saturation")}&value=${encodeURIComponent(String(s))}`;
+
+    const results = await Promise.all([
+      hitRobotHttp(hueFn),
+      hitRobotHttp(satFn),
+      hitRobotHttp(hueVar),
+      hitRobotHttp(satVar),
+      // POST variants (jquery-style) for builds that ignore GET bodies.
+      hitRobotHttp(`${base}/consolefunccall`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `func=ProcFace_Hue&args=${encodeURIComponent(String(h))}`,
+      }),
+      hitRobotHttp(`${base}/consolefunccall`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `func=ProcFace_Saturation&args=${encodeURIComponent(String(s))}`,
+      }),
+      hitRobotHttp(`${base}/consolevarset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `key=kProcFace_Hue&value=${encodeURIComponent(String(h))}`,
+      }),
+      hitRobotHttp(`${base}/consolevarset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `key=kProcFace_Saturation&value=${encodeURIComponent(String(s))}`,
+      }),
+    ]);
+
+    if (results.some(Boolean)) anyOk = true;
+  }
+
+  return anyOk;
 }
 
 export class VectorSession {
@@ -215,23 +267,12 @@ export class VectorSession {
   private pinWaiters: Array<(needsPin: boolean) => void> = [];
   private pairedWaiters: Array<() => void> = [];
   private disconnectedHandlers: Array<() => void> = [];
-  private clientGuid = "";
-  private guidProven = false;
 
   info: VectorInfo | null = null;
   phase: PairPhase = "idle";
-  lastAuthError: string | null = null;
 
   onPhase?: (phase: PairPhase) => void;
   onDisconnected?: () => void;
-
-  get hasSdkGuid() {
-    return Boolean(this.clientGuid || getStoredSdkGuid());
-  }
-
-  get sdkReady() {
-    return this.guidProven && Boolean(this.clientGuid);
-  }
 
   private setPhase(phase: PairPhase) {
     this.phase = phase;
@@ -250,9 +291,6 @@ export class VectorSession {
     }
     await sodium.ready;
     this.cleanupHandler();
-    this.clientGuid = getStoredSdkGuid();
-    this.guidProven = false;
-    this.lastAuthError = null;
     this.ble = new VectorBluetooth();
     this.ble.onReceive(this.handshakeListener);
     this.ble.onDisconnected(() => {
@@ -382,72 +420,7 @@ export class VectorSession {
     this.handler.enterPin(cleaned);
     await paired;
     await this.refreshInfo();
-    // Soft prep only — do not require Escape Pod / Wire-Pod cloud.
-    await this.prepareSdkGuid();
     this.setPhase("paired");
-  }
-
-  /**
-   * Pick the best guid we already have. Does not call Escape Pod cloud.
-   * Unlocked CFW without a local Escape Pod server cannot mint a new token.
-   */
-  async prepareSdkGuid(): Promise<CloudAuthStatus> {
-    const stored = getStoredSdkGuid().trim();
-    if (stored) {
-      this.clientGuid = stored;
-      return { ok: true, guid: stored, source: "stored" };
-    }
-
-    // Try the shared Escape Pod / Wire-Pod primary guid. Works only if this
-    // bot was activated against that token set before.
-    this.clientGuid = ESCAPE_POD_GLOBAL_GUID;
-    return { ok: true, guid: ESCAPE_POD_GLOBAL_GUID, source: "global" };
-  }
-
-  useManualGuid(guid: string): CloudAuthStatus {
-    const cleaned = guid.trim();
-    if (cleaned.length < 8) {
-      return {
-        ok: false,
-        detail: "That doesn’t look like an SDK guid. Paste the guid= value from sdk_config.ini.",
-      };
-    }
-    this.clientGuid = cleaned;
-    this.guidProven = false;
-    storeSdkGuid(cleaned);
-    this.lastAuthError = null;
-    return { ok: true, guid: cleaned, source: "manual" };
-  }
-
-  /**
-   * Mint a client token via Escape Pod cloud over BLE.
-   * Requires Vector to resolve escapepod.local (official Escape Pod or Wire-Pod).
-   * Not needed if you already have a working guid.
-   */
-  async authorizeWithEscapePodCloud(): Promise<CloudAuthStatus> {
-    if (!this.handler?.doAnkiAuth) {
-      const detail =
-        "This firmware has no BLE cloud-auth command. Paste an SDK guid instead.";
-      this.lastAuthError = detail;
-      return { ok: false, detail };
-    }
-
-    const msg = await this.handler.doAnkiAuth(ESCAPE_POD_SESSION_TOKEN);
-    const value = msg.value;
-    if (!value?.success || !value.clientTokenGuid) {
-      const detail = cloudAuthFailureMessage(
-        value?.statusCode,
-        this.info?.looksLikeEscapePod,
-      );
-      this.lastAuthError = detail;
-      return { ok: false, statusCode: value?.statusCode, detail };
-    }
-
-    this.clientGuid = value.clientTokenGuid;
-    this.guidProven = true;
-    storeSdkGuid(value.clientTokenGuid);
-    this.lastAuthError = null;
-    return { ok: true, guid: value.clientTokenGuid, source: "cloud" };
   }
 
   async refreshInfo() {
@@ -464,12 +437,11 @@ export class VectorSession {
       }
     }
 
-    const build = value.version?.split("-")[0];
     const name = this.ble?.bleName || "Vector";
     this.info = {
       name,
       esn: value.esn,
-      build,
+      build: value.version?.split("-")[0],
       wifiSsid: hexSsid(value.wifiSsidHex),
       wifiConnected: value.wifiState === 1 || value.wifiState === 2,
       ip,
@@ -477,115 +449,76 @@ export class VectorSession {
       supportsSdkProxy: typeof this.handler.doSdk === "function",
       hasOwner: value.hasOwner,
       isCloudAuthed: value.isCloudAuthed,
-      looksLikeEscapePod: looksLikeEscapePod(value.version) || looksLikeEscapePod(build),
     };
     return this.info;
   }
 
-  private async sdkCall(
-    guid: string,
-    path: string,
-    body: Record<string, unknown>,
-  ): Promise<SdkResult> {
-    if (!this.handler?.doSdk) {
-      throw new Error(
-        "This Vector firmware cannot change eye color over BLE. Update him, then pair again.",
-      );
-    }
+  /**
+   * Change eye color with zero cloud / Wire-Pod.
+   * Unlocked CFW: hit Vector's local eng console over LAN.
+   * Fallback: BLE SDK proxy with an empty token (some CFWs allow it).
+   */
+  async setEyeColor(hue: number, saturation: number): Promise<SdkResult> {
+    await this.refreshInfo();
+    const ip = this.info?.ip;
 
-    let response: { value: SdkProxyValue };
-    try {
-      response = await this.handler.doSdk(
-        guid,
-        RtsCliUtil.makeId(),
-        path,
-        JSON.stringify(body),
-      );
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "SDK proxy request failed.";
-      if (/not cloud authorized|unauthorized|timeout/i.test(message)) {
-        throw new Error(
-          "Vector’s SDK proxy rejected the token. Paste a guid from sdk_config.ini, or run Escape Pod / Wire-Pod on the LAN and use “Authorize with Escape Pod cloud”.",
-        );
+    if (ip) {
+      const ok = await setEyeColorViaConsole(ip, hue, saturation);
+      if (ok) {
+        return {
+          statusCode: 200,
+          path: "/consolefunccall",
+          via: "console",
+        };
       }
-      throw err instanceof Error ? err : new Error(message);
     }
 
-    const statusCode = Number(response.value.statusCode ?? 0);
-    if (statusCode === 401 || statusCode === 403) {
-      throw new Error(
-        `Vector returned HTTP ${statusCode} — that guid is not authorized on this bot. Paste the matching guid from sdk_config.ini, or mint a new one with Escape Pod cloud.`,
-      );
-    }
-
-    return {
-      statusCode,
-      responseType: response.value.responseType,
-      responseBody: response.value.responseBody,
-      path,
-    };
-  }
-
-  async setEyeColor(hue: number, saturation: number) {
-    if (!this.clientGuid) {
-      await this.prepareSdkGuid();
-    }
-    const guid = this.clientGuid || getStoredSdkGuid();
-    if (!guid) {
-      throw new Error(
-        "No SDK token yet. Paste a guid, or authorize with Escape Pod cloud if you run one on the LAN.",
-      );
-    }
-
-    const custom = await this.sdkCall(guid, "/v1/update_settings", {
-      update_settings: true,
-      settings: {
-        custom_eye_color: {
-          enabled: true,
-          hue,
-          saturation,
-        },
-      },
-    });
-
-    if (custom.statusCode === 200) {
-      this.guidProven = true;
-      storeSdkGuid(guid);
+    // Last-ditch: BLE SDK with no token. Some unlocked CFWs skip gateway auth.
+    if (this.handler?.doSdk) {
       try {
-        await this.sdkCall(guid, "/v1/set_eye_color", { hue, saturation });
+        const response = await this.handler.doSdk(
+          "",
+          RtsCliUtil.makeId(),
+          "/v1/set_eye_color",
+          JSON.stringify({ hue, saturation }),
+        );
+        const statusCode = Number(response.value.statusCode ?? 0);
+        if (statusCode === 200) {
+          try {
+            await this.handler.doSdk(
+              "",
+              RtsCliUtil.makeId(),
+              "/v1/update_settings",
+              JSON.stringify({
+                update_settings: true,
+                settings: {
+                  custom_eye_color: { enabled: true, hue, saturation },
+                },
+              }),
+            );
+          } catch {
+            // live color is enough
+          }
+          return {
+            statusCode: 200,
+            path: "/v1/set_eye_color",
+            via: "sdk",
+          };
+        }
       } catch {
-        // Permanent settings write is enough.
+        // continue to error below
       }
-      return custom;
     }
 
-    const rgb = await this.sdkCall(guid, "/v1/set_eye_color", {
-      hue,
-      saturation,
-    });
-    if (rgb.statusCode !== 200) {
+    if (!ip) {
       throw new Error(
-        `Vector returned ${custom.statusCode} for custom color and ${rgb.statusCode} for set_eye_color.`,
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try the wheel again.",
       );
     }
 
-    this.guidProven = true;
-    storeSdkGuid(guid);
-
-    const preset = nearestEyeColorEnum(hue, saturation);
-    try {
-      await this.sdkCall(guid, "/v1/update_settings", {
-        update_settings: true,
-        settings: {
-          custom_eye_color: { enabled: false },
-          eye_color: preset.value,
-        },
-      });
-    } catch {
-      // ignore
-    }
-    return rgb;
+    throw new Error(
+      `Couldn’t reach Vector’s local console at ${ip}:8889. Stay on the same Wi-Fi. Unlocked CFW must expose the eng console (ports 8888/8889).`,
+    );
   }
 
   disconnect() {

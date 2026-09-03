@@ -19,7 +19,6 @@ import { type Hs } from "@/lib/vector/color";
 import {
   bluetoothSupported,
   EYE_COLOR_ENUM,
-  getStoredSdkGuid,
   VectorSession,
   type PairPhase,
   type VectorInfo,
@@ -46,21 +45,16 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           ip: "192.168.1.64",
           rtsVersion: 6,
           supportsSdkProxy: true,
-          looksLikeEscapePod: false,
         }
       : null,
   );
   const [hs, setHs] = useState<Hs>({ hue: 0.42, saturation: 1 });
   const [lastSent, setLastSent] = useState<string | null>(null);
   const [bleOk, setBleOk] = useState(false);
-  const [guidInput, setGuidInput] = useState("");
-  const [authBusy, setAuthBusy] = useState(false);
-  const [showGuidHelp, setShowGuidHelp] = useState(false);
   const sendTimer = useRef<number | null>(null);
 
   useEffect(() => {
     setBleOk(bluetoothSupported());
-    setGuidInput(getStoredSdkGuid());
   }, []);
 
   useEffect(() => {
@@ -115,11 +109,9 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
         return;
       }
       await session.refreshInfo();
-      await session.prepareSdkGuid();
       setInfo(session.info);
-      setGuidInput(getStoredSdkGuid() || guidInput);
       setPhase("eyes");
-      setLastSent("Paired. Try the wheel — if Vector rejects the token, use the auth options below.");
+      setLastSent("Paired. Drag the wheel.");
     } catch (err) {
       setPairPhase("idle");
       setError(err instanceof Error ? err.message : "Could not find Vector.");
@@ -136,14 +128,12 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     try {
       await session.submitPin(pin);
       setInfo(session.info);
-      setGuidInput(getStoredSdkGuid() || guidInput);
       setPhase("eyes");
       setLastSent(
-        "PIN accepted. Eye color needs an SDK token — try the wheel, or authorize below if it fails.",
+        session.info?.ip
+          ? `PIN accepted · talking to ${session.info.ip} on your LAN — no cloud.`
+          : "PIN accepted. Connect Vector to Wi-Fi so eye color can reach him.",
       );
-      if (session.lastAuthError) {
-        setError(session.lastAuthError);
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Pairing failed.");
     } finally {
@@ -169,57 +159,20 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     setSending(true);
     setLastSent("Sending to Vector…");
     try {
-      await session.setEyeColor(next.hue, next.saturation);
-      setLastSent("Eye color applied.");
+      const result = await session.setEyeColor(next.hue, next.saturation);
+      setLastSent(
+        result.via === "console"
+          ? "Eye color sent over his local console — no servers."
+          : "Eye color sent.",
+      );
       setError(null);
-      setShowGuidHelp(false);
+      setInfo(session.info);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Could not set eye color.";
-      setError(message);
+      setError(err instanceof Error ? err.message : "Could not set eye color.");
       setLastSent(null);
-      setShowGuidHelp(true);
     } finally {
       setSending(false);
     }
-  }
-
-  async function authorizeEscapePod() {
-    const session = sessionRef.current;
-    if (!session) return;
-    setAuthBusy(true);
-    setError(null);
-    try {
-      const result = await session.authorizeWithEscapePodCloud();
-      if (!result.ok) {
-        setError(result.detail);
-        setShowGuidHelp(true);
-        return;
-      }
-      setLastSent("Escape Pod cloud authorized. Drag the wheel.");
-      setShowGuidHelp(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Escape Pod auth failed.");
-      setShowGuidHelp(true);
-    } finally {
-      setAuthBusy(false);
-    }
-  }
-
-  function saveManualGuid() {
-    const session = sessionRef.current;
-    if (!session) {
-      setError("Pair with Vector first, then paste the guid.");
-      return;
-    }
-    const result = session.useManualGuid(guidInput);
-    if (!result.ok) {
-      setError(result.detail);
-      return;
-    }
-    setError(null);
-    setLastSent("SDK guid saved. Try the wheel.");
-    setShowGuidHelp(false);
   }
 
   function disconnect() {
@@ -230,7 +183,6 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     setPin("");
     setLastSent(null);
     setError(null);
-    setShowGuidHelp(false);
   }
 
   return (
@@ -244,9 +196,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             Eye Color
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
-            Double-click his backpack, enter the PIN, then paint his eyes. Works
-            with unlocked CFW — no Wire-Pod required if you already have an SDK
-            guid.
+            Double-click his backpack, enter the PIN, paint his eyes. Unlocked
+            CFW — no Wire-Pod, no cloud.
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
@@ -265,9 +216,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           <CardHeader>
             <CardTitle>Find Vector over BLE</CardTitle>
             <CardDescription>
-              Chrome or Edge on a computer or Android. The PIN unlocks an
-              encrypted BLE link. Eye-color commands still need an SDK token —
-              unlocked CFW does not skip that.
+              Chrome or Edge on a computer or Android. Same Wi-Fi as Vector.
+              Color goes to his onboard console — nothing phones home.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-5">
@@ -338,7 +288,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
               Enter the PIN on his face
             </CardTitle>
             <CardDescription>
-              This unlocks BLE. It does not talk to Wire-Pod.
+              That’s it. No accounts, no servers, no guid paste.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -375,7 +325,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             <CardHeader>
               <CardTitle>RGB wheel</CardTitle>
               <CardDescription>
-                Writes permanent custom eye color over the BLE SDK proxy.
+                Pushes hue/saturation straight to Vector’s face console on your
+                LAN.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-5">
@@ -421,102 +372,33 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             </CardContent>
           </Card>
 
-          <div className="flex flex-col gap-6">
-            <Card className="bg-zinc-950/80">
-              <CardHeader>
-                <CardTitle>{info?.name ?? "Vector"}</CardTitle>
-                <CardDescription>
-                  Stay on the same Wi-Fi. Color rides the BLE session after the
-                  PIN.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-4">
-                <VectorFace hue={hs.hue} saturation={hs.saturation} paired />
-                <dl className="grid grid-cols-2 gap-3 text-sm">
-                  <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
-                  <Info label="IP" value={info?.ip ?? "—"} />
-                  <Info label="Serial" value={info?.esn ?? "—"} />
-                  <Info label="Build" value={info?.build ?? "—"} />
-                </dl>
-                {info?.looksLikeEscapePod ? (
-                  <p className="text-sm text-amber-200">
-                    Build looks Escape Pod style (`ep`). Minting a new token
-                    needs escapepod.local on your LAN — not Anki cloud.
-                  </p>
-                ) : null}
-                {info && !info.wifiConnected ? (
-                  <p className="text-sm text-amber-200">
-                    Paired over BLE but not on Wi-Fi. Connect him to your
-                    network, then try again.
-                  </p>
-                ) : null}
-                <Button variant="outline" onClick={disconnect}>
-                  Disconnect
-                </Button>
-              </CardContent>
-            </Card>
-
-            <Card className="bg-zinc-950/80">
-              <CardHeader>
-                <CardTitle>SDK token</CardTitle>
-                <CardDescription>
-                  Unlocked CFW still needs a client guid for eye color. Anki
-                  cloud is dead, so PIN alone cannot mint one. Skip Wire-Pod if
-                  you already have a guid.
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-4">
-                {(showGuidHelp || error) && !demo ? (
-                  <p className="text-sm text-zinc-400">
-                    Prefer a guid from{" "}
-                    <code className="text-zinc-200">~/.anki_vector/sdk_config.ini</code>{" "}
-                    (the <code className="text-zinc-200">guid=</code> line). Only
-                    use Escape Pod cloud if that server is actually running on
-                    your network.
-                  </p>
-                ) : null}
-
-                <div className="flex flex-col gap-2">
-                  <label className="text-xs tracking-wide text-zinc-500 uppercase">
-                    Existing SDK guid
-                  </label>
-                  <Input
-                    value={guidInput}
-                    onChange={(event) => setGuidInput(event.target.value)}
-                    placeholder="paste guid= from sdk_config.ini"
-                    className="font-mono text-sm"
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <Button
-                    variant="secondary"
-                    disabled={demo || !guidInput.trim()}
-                    onClick={saveManualGuid}
-                  >
-                    Use this guid
-                  </Button>
-                </div>
-
-                <div className="border-t border-white/5 pt-4">
-                  <p className="mb-3 text-xs text-zinc-500">
-                    Optional — only if Escape Pod or Wire-Pod is running and
-                    Vector can resolve escapepod.local.
-                  </p>
-                  <Button
-                    variant="outline"
-                    className="w-full"
-                    disabled={demo || authBusy}
-                    onClick={() => void authorizeEscapePod()}
-                  >
-                    {authBusy ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : null}
-                    Authorize with Escape Pod cloud
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+          <Card className="bg-zinc-950/80">
+            <CardHeader>
+              <CardTitle>{info?.name ?? "Vector"}</CardTitle>
+              <CardDescription>
+                BLE for pairing, Wi-Fi for the color packets. No external
+                servers.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              <VectorFace hue={hs.hue} saturation={hs.saturation} paired />
+              <dl className="grid grid-cols-2 gap-3 text-sm">
+                <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
+                <Info label="IP" value={info?.ip ?? "—"} />
+                <Info label="Serial" value={info?.esn ?? "—"} />
+                <Info label="Build" value={info?.build ?? "—"} />
+              </dl>
+              {info && !info.wifiConnected ? (
+                <p className="text-sm text-amber-200">
+                  Paired over BLE but not on Wi-Fi. Connect him to your network,
+                  then try again.
+                </p>
+              ) : null}
+              <Button variant="outline" onClick={disconnect}>
+                Disconnect
+              </Button>
+            </CardContent>
+          </Card>
         </div>
       ) : null}
     </div>
