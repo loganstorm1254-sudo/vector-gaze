@@ -8,10 +8,17 @@ import { RtsV4Handler } from "@/vendor/vector-rts/rtsV4Handler.js";
 import { RtsV5Handler } from "@/vendor/vector-rts/rtsV5Handler.js";
 import { RtsV6Handler } from "@/vendor/vector-rts/rtsV6Handler.js";
 
-// Escape Pod / Wire-Pod shared session token used by wire-pod's BLE auth.
-// After backpack PIN pairing, this mints a clientTokenGuid on the robot with
-// no user-facing codes to paste.
+/**
+ * Escape Pod session token (same value Wire-Pod and official Escape Pod use).
+ * Only works when Vector can reach a local Escape Pod cloud at escapepod.local.
+ */
 const ESCAPE_POD_SESSION_TOKEN = "2vMhFgktH3Jrbemm2WHkfGN";
+
+/**
+ * Wire-Pod / Escape Pod default SDK guid used when a bot was activated with
+ * the shared primary token. Harmless to try; ignored if the bot never had it.
+ */
+const ESCAPE_POD_GLOBAL_GUID = "tni1TRsTRTaNSapjo0Y+Sw==";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let sodium: any = null;
@@ -34,6 +41,9 @@ export type VectorInfo = {
   ip?: string;
   rtsVersion: number;
   supportsSdkProxy: boolean;
+  hasOwner?: boolean;
+  isCloudAuthed?: boolean;
+  looksLikeEscapePod: boolean;
 };
 
 export type SdkResult = {
@@ -42,6 +52,10 @@ export type SdkResult = {
   responseBody?: string;
   path: string;
 };
+
+export type CloudAuthStatus =
+  | { ok: true; guid: string; source: "stored" | "global" | "cloud" | "manual" }
+  | { ok: false; statusCode?: number; detail: string };
 
 type RtsHandler = {
   enterPin: (pin: string) => void;
@@ -89,6 +103,16 @@ type CloudAuthValue = {
 
 const GUID_KEY = "vector-eyes-sdk-guid";
 
+const CLOUD_STATUS: Record<number, string> = {
+  0: "UnknownError",
+  1: "ConnectionError",
+  2: "WrongAccount",
+  3: "InvalidSessionToken",
+  4: "AuthorizedAsPrimary",
+  5: "AuthorizedAsSecondary",
+  6: "ReassociatedPrimary",
+};
+
 /** Official permanent presets (RobotSettings EyeColor enum). */
 export const EYE_COLOR_ENUM = [
   { name: "Teal", enum: "TIP_OVER_TEAL", value: 0, hue: 0.42, saturation: 1 },
@@ -118,6 +142,11 @@ function hexSsid(hex?: string) {
   }
 }
 
+function looksLikeEscapePod(build?: string) {
+  if (!build) return false;
+  return /ep\b/i.test(build) || /escapepod/i.test(build);
+}
+
 export function bluetoothSupported() {
   return typeof navigator !== "undefined" && Boolean(navigator.bluetooth);
 }
@@ -129,6 +158,10 @@ export function getStoredSdkGuid() {
 
 export function storeSdkGuid(guid: string) {
   window.localStorage.setItem(GUID_KEY, guid.trim());
+}
+
+export function clearStoredSdkGuid() {
+  window.localStorage.removeItem(GUID_KEY);
 }
 
 export function nearestEyeColorEnum(hue: number, saturation: number) {
@@ -149,6 +182,28 @@ export function nearestEyeColorEnum(hue: number, saturation: number) {
   return best;
 }
 
+function cloudAuthFailureMessage(statusCode?: number, epFirmware?: boolean) {
+  const label =
+    statusCode === undefined
+      ? "unknown"
+      : `${CLOUD_STATUS[statusCode] ?? "Unknown"} (${statusCode})`;
+
+  if (statusCode === 1) {
+    return (
+      `Vector couldn’t reach his cloud (${label}). ` +
+      (epFirmware
+        ? "His firmware is Escape Pod style, so he looks for escapepod.local on your LAN. That is official Escape Pod or Wire-Pod — without a local Escape Pod server running, minting a new SDK token fails. Anki’s cloud is gone."
+        : "Anki’s cloud is gone. Unlocked / CFW bots still need either a local Escape Pod server (escapepod.local) or an SDK guid that was minted earlier.")
+    );
+  }
+
+  if (statusCode === 3) {
+    return `Vector rejected the session token (${label}). Use an Escape Pod / Wire-Pod session, or paste an existing SDK guid.`;
+  }
+
+  return `Cloud auth failed (${label}). Unlocked CFW does not skip SDK auth — PIN only unlocks BLE.`;
+}
+
 export class VectorSession {
   private ble: InstanceType<typeof VectorBluetooth> | null = null;
   private handler: RtsHandler | null = null;
@@ -161,12 +216,22 @@ export class VectorSession {
   private pairedWaiters: Array<() => void> = [];
   private disconnectedHandlers: Array<() => void> = [];
   private clientGuid = "";
+  private guidProven = false;
 
   info: VectorInfo | null = null;
   phase: PairPhase = "idle";
+  lastAuthError: string | null = null;
 
   onPhase?: (phase: PairPhase) => void;
   onDisconnected?: () => void;
+
+  get hasSdkGuid() {
+    return Boolean(this.clientGuid || getStoredSdkGuid());
+  }
+
+  get sdkReady() {
+    return this.guidProven && Boolean(this.clientGuid);
+  }
 
   private setPhase(phase: PairPhase) {
     this.phase = phase;
@@ -186,6 +251,8 @@ export class VectorSession {
     await sodium.ready;
     this.cleanupHandler();
     this.clientGuid = getStoredSdkGuid();
+    this.guidProven = false;
+    this.lastAuthError = null;
     this.ble = new VectorBluetooth();
     this.ble.onReceive(this.handshakeListener);
     this.ble.onDisconnected(() => {
@@ -315,36 +382,72 @@ export class VectorSession {
     this.handler.enterPin(cleaned);
     await paired;
     await this.refreshInfo();
-    await this.ensureSdkAuthorized();
+    // Soft prep only — do not require Escape Pod / Wire-Pod cloud.
+    await this.prepareSdkGuid();
     this.setPhase("paired");
   }
 
   /**
-   * After BLE PIN succeeds, mint an SDK client token the same way Wire-Pod
-   * does — Escape Pod session key over RtsCloudSession. No guid paste.
+   * Pick the best guid we already have. Does not call Escape Pod cloud.
+   * Unlocked CFW without a local Escape Pod server cannot mint a new token.
    */
-  async ensureSdkAuthorized() {
-    if (!this.handler?.doAnkiAuth) {
-      throw new Error(
-        "This Vector firmware can’t authorize the SDK over BLE. Update to Escape Pod / Wire-Pod firmware.",
-      );
+  async prepareSdkGuid(): Promise<CloudAuthStatus> {
+    const stored = getStoredSdkGuid().trim();
+    if (stored) {
+      this.clientGuid = stored;
+      return { ok: true, guid: stored, source: "stored" };
     }
-    if (!this.handler.doSdk) {
-      throw new Error(
-        "This Vector firmware has no BLE SDK proxy. Update him, then pair again.",
-      );
+
+    // Try the shared Escape Pod / Wire-Pod primary guid. Works only if this
+    // bot was activated against that token set before.
+    this.clientGuid = ESCAPE_POD_GLOBAL_GUID;
+    return { ok: true, guid: ESCAPE_POD_GLOBAL_GUID, source: "global" };
+  }
+
+  useManualGuid(guid: string): CloudAuthStatus {
+    const cleaned = guid.trim();
+    if (cleaned.length < 8) {
+      return {
+        ok: false,
+        detail: "That doesn’t look like an SDK guid. Paste the guid= value from sdk_config.ini.",
+      };
+    }
+    this.clientGuid = cleaned;
+    this.guidProven = false;
+    storeSdkGuid(cleaned);
+    this.lastAuthError = null;
+    return { ok: true, guid: cleaned, source: "manual" };
+  }
+
+  /**
+   * Mint a client token via Escape Pod cloud over BLE.
+   * Requires Vector to resolve escapepod.local (official Escape Pod or Wire-Pod).
+   * Not needed if you already have a working guid.
+   */
+  async authorizeWithEscapePodCloud(): Promise<CloudAuthStatus> {
+    if (!this.handler?.doAnkiAuth) {
+      const detail =
+        "This firmware has no BLE cloud-auth command. Paste an SDK guid instead.";
+      this.lastAuthError = detail;
+      return { ok: false, detail };
     }
 
     const msg = await this.handler.doAnkiAuth(ESCAPE_POD_SESSION_TOKEN);
     const value = msg.value;
     if (!value?.success || !value.clientTokenGuid) {
-      throw new Error(
-        `Vector didn’t accept Escape Pod / Wire-Pod auth (status ${value?.statusCode ?? "?"}). He needs EP/Wire-Pod firmware — stock Anki cloud bots can’t mint a token from PIN alone.`,
+      const detail = cloudAuthFailureMessage(
+        value?.statusCode,
+        this.info?.looksLikeEscapePod,
       );
+      this.lastAuthError = detail;
+      return { ok: false, statusCode: value?.statusCode, detail };
     }
+
     this.clientGuid = value.clientTokenGuid;
+    this.guidProven = true;
     storeSdkGuid(value.clientTokenGuid);
-    return value.clientTokenGuid;
+    this.lastAuthError = null;
+    return { ok: true, guid: value.clientTokenGuid, source: "cloud" };
   }
 
   async refreshInfo() {
@@ -361,16 +464,20 @@ export class VectorSession {
       }
     }
 
+    const build = value.version?.split("-")[0];
     const name = this.ble?.bleName || "Vector";
     this.info = {
       name,
       esn: value.esn,
-      build: value.version?.split("-")[0],
+      build,
       wifiSsid: hexSsid(value.wifiSsidHex),
       wifiConnected: value.wifiState === 1 || value.wifiState === 2,
       ip,
       rtsVersion: this.version,
       supportsSdkProxy: typeof this.handler.doSdk === "function",
+      hasOwner: value.hasOwner,
+      isCloudAuthed: value.isCloudAuthed,
+      looksLikeEscapePod: looksLikeEscapePod(value.version) || looksLikeEscapePod(build),
     };
     return this.info;
   }
@@ -398,27 +505,22 @@ export class VectorSession {
       const message =
         err instanceof Error ? err.message : "SDK proxy request failed.";
       if (/not cloud authorized|unauthorized|timeout/i.test(message)) {
-        // One retry: re-auth with Escape Pod token then fail clearly.
-        try {
-          await this.ensureSdkAuthorized();
-          response = await this.handler.doSdk(
-            this.clientGuid,
-            RtsCliUtil.makeId(),
-            path,
-            JSON.stringify(body),
-          );
-        } catch {
-          throw new Error(
-            "Vector’s SDK proxy is not authorized. Pair again after he’s on Escape Pod / Wire-Pod firmware.",
-          );
-        }
-      } else {
-        throw err instanceof Error ? err : new Error(message);
+        throw new Error(
+          "Vector’s SDK proxy rejected the token. Paste a guid from sdk_config.ini, or run Escape Pod / Wire-Pod on the LAN and use “Authorize with Escape Pod cloud”.",
+        );
       }
+      throw err instanceof Error ? err : new Error(message);
+    }
+
+    const statusCode = Number(response.value.statusCode ?? 0);
+    if (statusCode === 401 || statusCode === 403) {
+      throw new Error(
+        `Vector returned HTTP ${statusCode} — that guid is not authorized on this bot. Paste the matching guid from sdk_config.ini, or mint a new one with Escape Pod cloud.`,
+      );
     }
 
     return {
-      statusCode: Number(response.value.statusCode ?? 0),
+      statusCode,
       responseType: response.value.responseType,
       responseBody: response.value.responseBody,
       path,
@@ -427,14 +529,15 @@ export class VectorSession {
 
   async setEyeColor(hue: number, saturation: number) {
     if (!this.clientGuid) {
-      await this.ensureSdkAuthorized();
+      await this.prepareSdkGuid();
     }
     const guid = this.clientGuid || getStoredSdkGuid();
     if (!guid) {
-      throw new Error("Could not authorize Vector for eye color. Pair again.");
+      throw new Error(
+        "No SDK token yet. Paste a guid, or authorize with Escape Pod cloud if you run one on the LAN.",
+      );
     }
 
-    // Same payload Wire-Pod uses — permanent custom RGB via settings jdoc.
     const custom = await this.sdkCall(guid, "/v1/update_settings", {
       update_settings: true,
       settings: {
@@ -447,7 +550,8 @@ export class VectorSession {
     });
 
     if (custom.statusCode === 200) {
-      // Also nudge live face color immediately.
+      this.guidProven = true;
+      storeSdkGuid(guid);
       try {
         await this.sdkCall(guid, "/v1/set_eye_color", { hue, saturation });
       } catch {
@@ -456,7 +560,6 @@ export class VectorSession {
       return custom;
     }
 
-    // Fallback: temporary SDK eye color + nearest permanent enum preset.
     const rgb = await this.sdkCall(guid, "/v1/set_eye_color", {
       hue,
       saturation,
@@ -466,6 +569,9 @@ export class VectorSession {
         `Vector returned ${custom.statusCode} for custom color and ${rgb.statusCode} for set_eye_color.`,
       );
     }
+
+    this.guidProven = true;
+    storeSdkGuid(guid);
 
     const preset = nearestEyeColorEnum(hue, saturation);
     try {
