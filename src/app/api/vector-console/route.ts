@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { uploadOverlayViaUnlockSsh } from "@/lib/vector/ssh-upload";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -170,6 +169,8 @@ async function uploadOverlayJpeg(ip: string, jpegBase64: string) {
     return { ok: false, tried: 0, error: "JPEG payload too small" };
   }
 
+  // Dynamic import keeps ssh2 out of the Turbopack graph at build time.
+  const { uploadOverlayViaUnlockSsh } = await import("@/lib/vector/ssh-upload");
   const ssh = await uploadOverlayViaUnlockSsh(ip, bytes);
   if (ssh.ok) {
     return { ok: true, tried: 1, via: "unlock-ssh" as const, path: ssh.path };

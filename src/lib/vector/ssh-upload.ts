@@ -1,22 +1,38 @@
-import { Client } from "ssh2";
 import { VECTOR_UNLOCK_ROOT_KEY } from "@/lib/vector/keys/unlock-root";
 
 const REMOTE_PATH = "/data/data/customFaceOverlay.jpg";
 const PERSISTENT_PATH =
   "/data/data/com.anki.victor/persistent/customFaceOverlay.jpg";
 
+type UploadResult = { ok: boolean; path?: string; error?: string };
+
 /**
  * Write customFaceOverlay.jpg over SSH using the well-known unlocked-Vector root key.
  * Also keeps a copy under persistent/ and symlinks so later HTTP PUTs can replace it.
+ *
+ * ssh2 is loaded dynamically so Next/Turbopack does not try to bundle its native crypto.
  */
-export function uploadOverlayViaUnlockSsh(
+export async function uploadOverlayViaUnlockSsh(
   ip: string,
   jpeg: Buffer,
-): Promise<{ ok: boolean; path?: string; error?: string }> {
+): Promise<UploadResult> {
+  let Client: typeof import("ssh2").Client;
+  try {
+    ({ Client } = await import("ssh2"));
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? `ssh2 unavailable: ${err.message}`
+          : "ssh2 unavailable",
+    };
+  }
+
   return new Promise((resolve) => {
     const conn = new Client();
     let settled = false;
-    const done = (result: { ok: boolean; path?: string; error?: string }) => {
+    const done = (result: UploadResult) => {
       if (settled) return;
       settled = true;
       try {
@@ -39,7 +55,6 @@ export function uploadOverlayViaUnlockSsh(
           return;
         }
 
-        // Ensure persistent dir exists, write both paths, then symlink.
         conn.exec(
           "mkdir -p /data/data/com.anki.victor/persistent && " +
             `rm -f '${REMOTE_PATH}' '${PERSISTENT_PATH}' && ` +
@@ -63,7 +78,6 @@ export function uploadOverlayViaUnlockSsh(
                   `test -f '${REMOTE_PATH}' && test -f '${PERSISTENT_PATH}'`,
                 (linkErr, stream) => {
                   if (linkErr) {
-                    // Fall back to a second direct write to the Custom path.
                     sftp.writeFile(REMOTE_PATH, jpeg, (directErr) => {
                       clearTimeout(timer);
                       if (directErr) {
