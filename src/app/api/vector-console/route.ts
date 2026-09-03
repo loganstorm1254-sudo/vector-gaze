@@ -1,8 +1,5 @@
 import { NextResponse } from "next/server";
-import { writeFile, unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { uploadOverlayViaUnlockSsh } from "@/lib/vector/ssh-upload";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -163,117 +160,57 @@ async function setOverlay(ip: string, flavor: number | null, opacity: number) {
   return { ok, tried, flavor, opacity: opacityClamped };
 }
 
-function run(cmd: string, args: string[], env?: NodeJS.ProcessEnv) {
-  return new Promise<{ code: number; stdout: string; stderr: string }>(
-    (resolve) => {
-      const child = spawn(cmd, args, { env: { ...process.env, ...env } });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
-      });
-      child.on("close", (code) => {
-        resolve({ code: code ?? 1, stdout, stderr });
-      });
-      child.on("error", (err) => {
-        resolve({ code: 1, stdout, stderr: String(err) });
-      });
-    },
-  );
-}
+/**
+ * Write /data/data/customFaceOverlay.jpg using the public unlocked-Vector root key.
+ * No user password / SCP — works whenever this Next process can reach the robot LAN.
+ */
+async function uploadOverlayJpeg(ip: string, jpegBase64: string) {
+  const bytes = Buffer.from(jpegBase64, "base64");
+  if (bytes.byteLength < 32) {
+    return { ok: false, tried: 0, error: "JPEG payload too small" };
+  }
 
-/** Optional local-dev SCP when VECTOR_SSH_PASSWORD or request password is set. */
-async function uploadOverlayJpeg(
-  ip: string,
-  jpegBase64: string,
-  sshPassword?: string,
-) {
-  const password =
-    sshPassword?.trim() || process.env.VECTOR_SSH_PASSWORD?.trim() || "";
-  if (!password) {
-    // Try HTTP PUT from this Node process (same LAN when running npm run dev).
-    const bytes = Buffer.from(jpegBase64, "base64");
-    let putOk = false;
-    let tried = 0;
-    const paths = [
-      "/persistent/../../customFaceOverlay.jpg",
-      "/cache/../../customFaceOverlay.jpg",
-      "/resources/../../../../data/data/customFaceOverlay.jpg",
-      "/customFaceOverlay.jpg",
-    ];
-    for (const port of ANIM_PORTS) {
-      for (const path of paths) {
-        const url = `http://${ip}:${port}${path}`;
-        tried += 1;
-        await hit(url, { method: "DELETE" });
-        tried += 1;
-        if (
-          await hit(url, {
-            method: "PUT",
-            headers: {
-              "Content-Type": "image/jpeg",
-              "Content-Length": String(bytes.length),
-            },
-            body: bytes,
-          })
-        ) {
-          putOk = true;
-        }
+  const ssh = await uploadOverlayViaUnlockSsh(ip, bytes);
+  if (ssh.ok) {
+    return { ok: true, tried: 1, via: "unlock-ssh" as const, path: ssh.path };
+  }
+
+  // Fallback: HTTP PUT into eng-console rewrite paths (same LAN).
+  let putOk = false;
+  let tried = 0;
+  const paths = [
+    "/persistent/customFaceOverlay.jpg",
+    "/resources/assets/faceOverlays/galaxy.jpg",
+    "/cache/customFaceOverlay.jpg",
+  ];
+  for (const port of ANIM_PORTS) {
+    for (const path of paths) {
+      const url = `http://${ip}:${port}${path}`;
+      tried += 1;
+      await hit(url, { method: "DELETE" });
+      tried += 1;
+      if (
+        await hit(url, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "image/jpeg",
+            "Content-Length": String(bytes.length),
+          },
+          body: bytes,
+        })
+      ) {
+        putOk = true;
       }
     }
-    if (putOk) return { ok: true, tried, via: "http-put" as const };
-    return {
-      ok: false,
-      tried,
-      error:
-        "No SSH password and HTTP PUT to the robot failed. Enter SSH password or SCP customFaceOverlay.jpg to /data/data/.",
-    };
   }
-
-  const user = process.env.VECTOR_SSH_USER?.trim() || "root";
-  const tmp = join(tmpdir(), `customFaceOverlay-${Date.now()}.jpg`);
-  try {
-    await writeFile(tmp, Buffer.from(jpegBase64, "base64"));
-    // Remove old file first so the new image fully replaces it.
-    await run(
-      "sshpass",
-      [
-        "-p",
-        password,
-        "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        `${user}@${ip}`,
-        "rm -f /data/data/customFaceOverlay.jpg",
-      ],
-    );
-    const scp = await run("sshpass", [
-      "-p",
-      password,
-      "scp",
-      "-o",
-      "StrictHostKeyChecking=no",
-      "-o",
-      "UserKnownHostsFile=/dev/null",
-      tmp,
-      `${user}@${ip}:/data/data/customFaceOverlay.jpg`,
-    ]);
-    if (scp.code === 0) {
-      return { ok: true, tried: 1, via: "scp" as const };
-    }
-    return {
-      ok: false,
-      tried: 1,
-      error: scp.stderr || scp.stdout || `scp exited ${scp.code}`,
-    };
-  } finally {
-    await unlink(tmp).catch(() => undefined);
+  if (putOk) {
+    return { ok: true, tried, via: "http-put" as const };
   }
+  return {
+    ok: false,
+    tried,
+    error: ssh.error || "Unlock-key SSH and HTTP PUT both failed.",
+  };
 }
 
 export async function POST(request: Request) {
@@ -286,7 +223,6 @@ export async function POST(request: Request) {
     flavor?: number | null;
     opacity?: number;
     jpegBase64?: string;
-    sshPassword?: string;
   };
   try {
     body = await request.json();
@@ -349,11 +285,7 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    const result = await uploadOverlayJpeg(
-      ip,
-      jpegBase64,
-      typeof body.sshPassword === "string" ? body.sshPassword : undefined,
-    );
+    const result = await uploadOverlayJpeg(ip, jpegBase64);
     return NextResponse.json({ ip, action, ...result });
   }
 

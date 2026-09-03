@@ -487,25 +487,71 @@ async function setEyeOverlayViaConsole(
   return anyOk;
 }
 
+/** WireOS Custom slot (flavor 8) reads this path. */
+const CUSTOM_REMOTE_PATH = "/data/data/customFaceOverlay.jpg";
+
 /**
- * Push customFaceOverlay.jpg onto the robot (overwrites any previous file).
- * Tries local SCP (VECTOR_SSH_PASSWORD / request password) then browser PUT/DELETE.
+ * Browser-reachable eng-console rewrite for staging a custom JPG when SSH
+ * isn't available (e.g. site hosted on Vercel). Overwrites the Galaxy asset
+ * and we load flavor 7 — stock Galaxy is restored from /face-overlays/galaxy.jpg
+ * when the user picks Galaxy again.
+ */
+const CUSTOM_HTTP_STAGING = {
+  flavor: 7 as const,
+  uriPath: "/resources/assets/faceOverlays/galaxy.jpg",
+  stockUrl: "/face-overlays/galaxy.jpg",
+};
+
+export type CustomUploadResult = {
+  ok: boolean;
+  flavor: number;
+  via: "unlock-ssh" | "http-resources" | "http-persistent";
+};
+
+async function blobToBase64(jpeg: Blob): Promise<string> {
+  const buf = new Uint8Array(await jpeg.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < buf.length; i += 1) binary += String.fromCharCode(buf[i]!);
+  return btoa(binary);
+}
+
+async function putRobotJpeg(
+  ip: string,
+  uriPath: string,
+  jpeg: Blob,
+): Promise<boolean> {
+  let anyOk = false;
+  for (const port of CONSOLE_PORTS) {
+    const url = `http://${ip}:${port}${uriPath}`;
+    await hitRobotHttp(url, { method: "DELETE" });
+    const put = await hitRobotHttp(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "image/jpeg",
+        "Content-Length": String(jpeg.size),
+      },
+      body: jpeg,
+    });
+    if (put === "ok" || put === "opaque") anyOk = true;
+  }
+  return anyOk;
+}
+
+/**
+ * Push a custom overlay JPG onto the robot automatically (no password / SCP).
+ * 1) Local Next on the same LAN → unlock-key SSH to /data/data/customFaceOverlay.jpg
+ * 2) Otherwise → HTTP PUT into eng-console /resources (Galaxy staging) from the browser
  */
 export async function uploadCustomOverlayJpeg(
   ip: string,
   jpeg: Blob,
-  sshPassword?: string,
-): Promise<boolean> {
+): Promise<CustomUploadResult | null> {
   await ensureLocalNetworkAccess();
 
-  const buf = new Uint8Array(await jpeg.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < buf.length; i += 1) binary += String.fromCharCode(buf[i]!);
-  const jpegBase64 = btoa(binary);
-
-  // Local Next on the same LAN can SCP when a password is available.
+  // Local Next can SSH with the well-known unlocked-Vector root key.
   if (isLocalDevHost()) {
     try {
+      const jpegBase64 = await blobToBase64(jpeg);
       const res = await fetch("/api/vector-console", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -513,60 +559,57 @@ export async function uploadCustomOverlayJpeg(
           ip,
           action: "overlay-upload",
           jpegBase64,
-          sshPassword: sshPassword || undefined,
         }),
       });
       if (res.ok) {
-        const data = (await res.json()) as { ok?: boolean };
-        if (data.ok) return true;
+        const data = (await res.json()) as {
+          ok?: boolean;
+          via?: string;
+        };
+        if (data.ok) {
+          if (data.via === "unlock-ssh") {
+            return { ok: true, flavor: 8, via: "unlock-ssh" };
+          }
+          // API HTTP PUT may have written resources/galaxy or persistent.
+          if (data.via === "http-put") {
+            return { ok: true, flavor: 7, via: "http-resources" };
+          }
+          return { ok: true, flavor: 8, via: "unlock-ssh" };
+        }
       }
     } catch {
-      // fall through to direct browser writes
+      // fall through to browser HTTP
     }
   }
 
-  const paths = [
-    // Target path WireOS LoadCustomEyePNG reads.
-    "/persistent/../../customFaceOverlay.jpg",
-    "/cache/../../customFaceOverlay.jpg",
-    "/resources/../../../../data/data/customFaceOverlay.jpg",
-    "/daslog/../../data/data/customFaceOverlay.jpg",
-    "/persistent/customFaceOverlay.jpg",
-    "/cache/customFaceOverlay.jpg",
-    "/customFaceOverlay.jpg",
-    "/data/data/customFaceOverlay.jpg",
-  ];
-
-  for (const port of CONSOLE_PORTS) {
-    for (const path of paths) {
-      const url = `http://${ip}:${port}${path}`;
-
-      // Wipe any previous file at this path first.
-      await hitRobotHttp(url, { method: "DELETE" });
-
-      const put = await hitRobotHttp(url, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "image/jpeg",
-          "Content-Length": String(jpeg.size),
-        },
-        body: jpeg,
-      });
-      if (put === "ok") return true;
-
-      const post = await hitRobotHttp(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "image/jpeg",
-          "X-HTTP-Method-Override": "PUT",
-        },
-        body: jpeg,
-      });
-      if (post === "ok") return true;
-    }
+  // Vercel / remote: browser → robot LAN (Chrome Local Network Access).
+  if (await putRobotJpeg(ip, CUSTOM_HTTP_STAGING.uriPath, jpeg)) {
+    return {
+      ok: true,
+      flavor: CUSTOM_HTTP_STAGING.flavor,
+      via: "http-resources",
+    };
   }
 
-  return false;
+  // Last resort: persistent path (needs prior symlink for true Custom load).
+  if (await putRobotJpeg(ip, "/persistent/customFaceOverlay.jpg", jpeg)) {
+    return { ok: true, flavor: 8, via: "http-persistent" };
+  }
+
+  return null;
+}
+
+/** Restore stock Galaxy JPG on the robot (after Custom staging overwrote it). */
+export async function restoreStockGalaxyOverlay(ip: string): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+  try {
+    const res = await fetch(CUSTOM_HTTP_STAGING.stockUrl, { cache: "force-cache" });
+    if (!res.ok) return false;
+    const blob = await res.blob();
+    return putRobotJpeg(ip, CUSTOM_HTTP_STAGING.uriPath, blob);
+  } catch {
+    return false;
+  }
 }
 
 export class VectorSession {
@@ -583,6 +626,8 @@ export class VectorSession {
 
   info: VectorInfo | null = null;
   phase: PairPhase = "idle";
+  /** Flavor last used for a successful custom image push (7 staging or 8 file). */
+  lastCustomFlavor: number = 8;
 
   onPhase?: (phase: PairPhase) => void;
   onDisconnected?: () => void;
@@ -860,13 +905,12 @@ export class VectorSession {
   }
 
   /**
-   * Wipe any current custom overlay, replace /data/data/customFaceOverlay.jpg,
-   * then load Custom. Fails (and leaves overlay off) if the file wasn’t replaced.
+   * Wipe any current custom overlay, push the new JPG automatically, then load it.
+   * No SSH password / SCP — uses unlock-key SSH (local) or HTTP resources staging (Vercel).
    */
   async replaceCustomOverlay(
     jpeg: Blob,
     opacity = 0.8,
-    sshPassword?: string,
   ): Promise<SdkResult> {
     await this.refreshInfo();
     const ip = this.info?.ip;
@@ -879,35 +923,76 @@ export class VectorSession {
     // 1) Wipe whatever is currently showing.
     await setEyeOverlayViaConsole(ip, null, opacity);
 
-    // 2) Overwrite the on-robot JPG (DELETE + PUT / SCP).
-    const uploaded = await uploadCustomOverlayJpeg(ip, jpeg, sshPassword);
+    // 2) Write the new image automatically.
+    const uploaded = await uploadCustomOverlayJpeg(ip, jpeg);
     if (!uploaded) {
       throw new Error(
-        `Wiped the old overlay, but couldn’t write the new customFaceOverlay.jpg to ${ip}. Stock WireOS blocks HTTP file writes — set his SSH password below (local dev) or run: scp customFaceOverlay.jpg root@${ip}:/data/data/`,
+        `Wiped the old overlay, but couldn’t write the new image to ${ip}. Stay on the same Wi-Fi and click Allow for local network access.`,
       );
     }
 
-    // 3) Load Custom from the new file.
-    const ok = await setEyeOverlayViaConsole(ip, 8, opacity);
+    // 3) Load the flavor that matches where the file landed.
+    const ok = await setEyeOverlayViaConsole(ip, uploaded.flavor, opacity);
     if (!ok) {
       throw new Error(
-        `New overlay file was written but LOOK_LoadFaceOverlay didn’t reach ${ip}:8889.`,
+        `New overlay file was written (${uploaded.via}) but LOOK_LoadFaceOverlay didn’t reach ${ip}:8889.`,
       );
     }
 
-    // Extra reload so in-memory face buffer picks up the new pixels.
+    this.lastCustomFlavor = uploaded.flavor;
+
     await new Promise((r) => setTimeout(r, 150));
-    await setEyeOverlayViaConsole(ip, 8, opacity);
+    await setEyeOverlayViaConsole(ip, uploaded.flavor, opacity);
 
     return {
       statusCode: 200,
-      path: "/data/data/customFaceOverlay.jpg",
+      path:
+        uploaded.flavor === 8
+          ? CUSTOM_REMOTE_PATH
+          : CUSTOM_HTTP_STAGING.uriPath,
       via: "console",
     };
   }
 
+  /**
+   * Reload the last custom overlay (opacity tweak) without re-uploading.
+   */
+  async reloadCustomOverlay(opacity = 0.8): Promise<SdkResult> {
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try overlays again.",
+      );
+    }
+    const ok = await setEyeOverlayViaConsole(ip, this.lastCustomFlavor, opacity);
+    if (!ok) {
+      throw new Error(
+        `Couldn’t reach Vector’s face console at ${ip}:8889 for overlays. Same Wi-Fi + Allow local network access.`,
+      );
+    }
+    return {
+      statusCode: 200,
+      path: "/consolefunccall?func=LOOK_LoadFaceOverlay",
+      via: "console",
+    };
+  }
+
+  /** Restore stock Galaxy asset on the robot, then load it. */
+  async setGalaxyOverlay(opacity = 0.8): Promise<SdkResult> {
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try overlays again.",
+      );
+    }
+    await restoreStockGalaxyOverlay(ip);
+    return this.setEyeOverlay(CUSTOM_HTTP_STAGING.flavor, opacity);
+  }
+
   /** Push a prepared 184×96 JPEG for the Custom overlay slot. */
-  async uploadCustomOverlay(jpeg: Blob, sshPassword?: string): Promise<boolean> {
+  async uploadCustomOverlay(jpeg: Blob): Promise<boolean> {
     await this.refreshInfo();
     const ip = this.info?.ip;
     if (!ip) {
@@ -915,7 +1000,8 @@ export class VectorSession {
         "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try the custom overlay again.",
       );
     }
-    return uploadCustomOverlayJpeg(ip, jpeg, sshPassword);
+    const result = await uploadCustomOverlayJpeg(ip, jpeg);
+    return Boolean(result?.ok);
   }
 
   disconnect() {

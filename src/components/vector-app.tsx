@@ -62,7 +62,6 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
   const [volume, setVolume] = useState<VolumeLevel>(3);
   const [overlayId, setOverlayId] = useState<FaceOverlayId>("off");
   const [overlayOpacity, setOverlayOpacity] = useState(0.8);
-  const [sshPassword, setSshPassword] = useState("");
   const [customPreview, setCustomPreview] = useState<PreparedOverlayJpeg | null>(
     null,
   );
@@ -272,26 +271,16 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
         if (!prepared) {
           throw new Error("Pick a custom image first.");
         }
-        try {
-          await session.replaceCustomOverlay(
-            prepared.blob,
-            opacity,
-            sshPassword || undefined,
-          );
-          setLastSent(
-            "Old custom wiped — new image written and loaded on his face.",
-          );
-        } catch (uploadErr) {
-          // Stay wiped. Reloading Custom here would bring the OLD file back.
-          downloadOverlayJpeg(prepared.blob);
-          setOverlayId("off");
-          const detail =
-            uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
-          setError(detail);
-          setLastSent(
-            "Old custom wiped from his face. New JPG downloaded — SCP it to /data/data/customFaceOverlay.jpg, then tap Custom and Apply overlay.",
-          );
-        }
+        await session.replaceCustomOverlay(prepared.blob, opacity);
+        setLastSent(
+          "Old custom wiped — new image written and loaded on his face.",
+        );
+      } else if (id === "custom") {
+        await session.reloadCustomOverlay(opacity);
+        setLastSent("Custom overlay reloaded.");
+      } else if (id === "galaxy") {
+        await session.setGalaxyOverlay(opacity);
+        setLastSent("Galaxy overlay loaded via Face console — no servers.");
       } else {
         await session.setEyeOverlay(entry.flavor, opacity);
         setLastSent(
@@ -623,11 +612,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 <code className="text-teal-200/90">ProcFace_CustomEyes</code>,
                 pick a flavor, then{" "}
                 <code className="text-teal-200/90">LOOK_LoadFaceOverlay</code>.
-                Custom expects{" "}
-                <code className="text-teal-200/90">
-                  /data/data/customFaceOverlay.jpg
-                </code>{" "}
-                (184×96).
+                Custom uploads your image from this page automatically
+                (184×96) — no SCP.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-5">
@@ -710,25 +696,6 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 </label>
               </div>
 
-              <label className="flex flex-col gap-1 text-sm text-zinc-300">
-                <span className="text-xs tracking-wide text-zinc-500 uppercase">
-                  Robot SSH password (for replacing custom JPG)
-                </span>
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  placeholder="root password — overwrites /data/data/customFaceOverlay.jpg"
-                  value={sshPassword}
-                  onChange={(event) => setSshPassword(event.target.value)}
-                  className="max-w-md bg-zinc-900"
-                />
-                <span className="text-xs text-zinc-500">
-                  Lets Custom wipe the old file and write yours. Use with local{" "}
-                  <code className="text-zinc-400">npm run dev</code> on the same
-                  Wi-Fi. Kept only in this page session.
-                </span>
-              </label>
-
               <input
                 ref={fileInputRef}
                 type="file"
@@ -756,7 +723,6 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                   disabled={sending || demo || overlayId === "off"}
                   onClick={() =>
                     void pushOverlay(overlayId, overlayOpacity, customPreview, {
-                      // Apply reloads from robot disk (after SCP) without requiring rewrite.
                       replaceCustom: false,
                     })
                   }
