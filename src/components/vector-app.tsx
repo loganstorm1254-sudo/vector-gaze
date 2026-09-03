@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bluetooth, KeyRound, Loader2, Wifi } from "lucide-react";
+import { Bluetooth, KeyRound, Loader2, Volume2, Wifi } from "lucide-react";
 
 import { ColorWheel } from "@/components/color-wheel";
 import { VectorFace } from "@/components/vector-face";
@@ -20,9 +20,11 @@ import {
   bluetoothSupported,
   ensureLocalNetworkAccess,
   EYE_COLOR_ENUM,
+  VOLUME_LEVELS,
   VectorSession,
   type PairPhase,
   type VectorInfo,
+  type VolumeLevel,
 } from "@/lib/vector/session";
 
 type UiPhase = "landing" | "pin" | "eyes";
@@ -50,9 +52,11 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       : null,
   );
   const [hs, setHs] = useState<Hs>({ hue: 0.42, saturation: 1 });
+  const [volume, setVolume] = useState<VolumeLevel>(3);
   const [lastSent, setLastSent] = useState<string | null>(null);
   const [bleOk, setBleOk] = useState(false);
   const sendTimer = useRef<number | null>(null);
+  const volumeTimer = useRef<number | null>(null);
 
   useEffect(() => {
     setBleOk(bluetoothSupported());
@@ -185,6 +189,38 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     }
   }
 
+  function queueVolume(level: VolumeLevel) {
+    setVolume(level);
+    if (demo) {
+      setLastSent("Preview only — connect a real Vector to push volume.");
+      return;
+    }
+    if (volumeTimer.current) window.clearTimeout(volumeTimer.current);
+    volumeTimer.current = window.setTimeout(() => {
+      void pushVolume(level);
+    }, 280);
+  }
+
+  async function pushVolume(level: VolumeLevel) {
+    const session = sessionRef.current;
+    if (!session) return;
+    setSending(true);
+    setLastSent("Setting volume…");
+    try {
+      await session.setVolume(level);
+      const label =
+        VOLUME_LEVELS.find((entry) => entry.value === level)?.name ?? String(level);
+      setLastSent(`Volume set to ${label} via eng console — no servers.`);
+      setError(null);
+      setInfo(session.info);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not set volume.");
+      setLastSent(null);
+    } finally {
+      setSending(false);
+    }
+  }
+
   function disconnect() {
     sessionRef.current?.disconnect();
     sessionRef.current = null;
@@ -203,14 +239,15 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
             Anki Vector
           </p>
           <h1 className="font-heading text-3xl text-white sm:text-4xl">
-            Eye Color
+            Eyes & Volume
           </h1>
           <p className="mt-2 max-w-xl text-sm text-zinc-400">
             Works on Vercel. Double-click his backpack, enter the PIN, paint his
-            eyes. Unlocked CFW — no Wire-Pod, no guid paste.
+            eyes and set speaker volume. Unlocked CFW — no Wire-Pod, no guid
+            paste.
           </p>
           <p className="mt-1 font-mono text-[10px] text-zinc-600">
-            build console-only · no SDK guid
+            build console-only · eyes + volume · no SDK guid
           </p>
         </div>
         <Badge variant="secondary" className="w-fit bg-zinc-900 text-zinc-300">
@@ -253,7 +290,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                 <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-teal-500/15 text-xs text-teal-200">
                   3
                 </span>
-                Find Vector, type that PIN, then use the wheel.
+                Find Vector, type that PIN, then set eyes and volume.
               </li>
             </ol>
 
@@ -334,82 +371,131 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       ) : null}
 
       {phase === "eyes" ? (
-        <div className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
+        <div className="flex flex-col gap-6">
+          <div className="grid gap-6 lg:grid-cols-[1fr_0.9fr]">
+            <Card className="bg-zinc-950/80">
+              <CardHeader>
+                <CardTitle>RGB wheel</CardTitle>
+                <CardDescription>
+                  Pushes hue/saturation straight to Vector’s face console on your
+                  LAN.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-5">
+                <ColorWheel
+                  hue={hs.hue}
+                  saturation={hs.saturation}
+                  onChange={queueEyeColor}
+                  disabled={sending}
+                />
+                <div className="flex flex-wrap gap-2">
+                  {EYE_COLOR_ENUM.map((preset) => (
+                    <button
+                      key={preset.name}
+                      type="button"
+                      className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-300 hover:border-teal-300/40 hover:text-white"
+                      onClick={() =>
+                        queueEyeColor({
+                          hue: preset.hue,
+                          saturation: preset.saturation,
+                        })
+                      }
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                </div>
+                <p className="font-mono text-xs text-zinc-500">
+                  hue {hs.hue.toFixed(2)} · sat {hs.saturation.toFixed(2)}
+                  {sending ? " · sending…" : ""}
+                </p>
+                {lastSent ? (
+                  <p className="text-sm text-teal-200/90">{lastSent}</p>
+                ) : null}
+                <Button
+                  size="lg"
+                  className="h-11 w-full bg-teal-400 text-zinc-950 hover:bg-teal-300"
+                  disabled={sending || demo}
+                  onClick={() => void pushEyeColor(hs)}
+                >
+                  {sending ? <Loader2 className="size-4 animate-spin" /> : null}
+                  Apply color
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card className="bg-zinc-950/80">
+              <CardHeader>
+                <CardTitle>{info?.name ?? "Vector"}</CardTitle>
+                <CardDescription>
+                  BLE for pairing, Wi-Fi for console packets. No external
+                  servers.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-4">
+                <VectorFace hue={hs.hue} saturation={hs.saturation} paired />
+                <dl className="grid grid-cols-2 gap-3 text-sm">
+                  <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
+                  <Info label="IP" value={info?.ip ?? "—"} />
+                  <Info label="Serial" value={info?.esn ?? "—"} />
+                  <Info label="Build" value={info?.build ?? "—"} />
+                </dl>
+                {info && !info.wifiConnected ? (
+                  <p className="text-sm text-amber-200">
+                    Paired over BLE but not on Wi-Fi. Connect him to your network,
+                    then try again.
+                  </p>
+                ) : null}
+                <Button variant="outline" onClick={disconnect}>
+                  Disconnect
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
+
           <Card className="bg-zinc-950/80">
             <CardHeader>
-              <CardTitle>RGB wheel</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+                <Volume2 className="size-4 text-teal-300" />
+                Speaker volume
+              </CardTitle>
               <CardDescription>
-                Pushes hue/saturation straight to Vector’s face console on your
-                LAN.
+                Same eng-console path as eyes: set{" "}
+                <code className="text-teal-200/90">MasterVolumeLevel</code>{" "}
+                (0–5), then{" "}
+                <code className="text-teal-200/90">DebugSetMasterVolume</code>{" "}
+                on port 8888.
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex flex-col gap-5">
-              <ColorWheel
-                hue={hs.hue}
-                saturation={hs.saturation}
-                onChange={queueEyeColor}
-                disabled={sending}
-              />
+            <CardContent className="flex flex-col gap-4">
               <div className="flex flex-wrap gap-2">
-                {EYE_COLOR_ENUM.map((preset) => (
+                {VOLUME_LEVELS.map((entry) => (
                   <button
-                    key={preset.name}
+                    key={entry.value}
                     type="button"
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-zinc-300 hover:border-teal-300/40 hover:text-white"
-                    onClick={() =>
-                      queueEyeColor({
-                        hue: preset.hue,
-                        saturation: preset.saturation,
-                      })
+                    disabled={sending}
+                    className={
+                      volume === entry.value
+                        ? "rounded-full border border-teal-300/50 bg-teal-400/15 px-3 py-1.5 text-xs text-teal-100"
+                        : "rounded-full border border-white/10 px-3 py-1.5 text-xs text-zinc-300 hover:border-teal-300/40 hover:text-white disabled:opacity-50"
                     }
+                    onClick={() => queueVolume(entry.value)}
                   >
-                    {preset.name}
+                    {entry.name}
                   </button>
                 ))}
               </div>
-              <p className="font-mono text-xs text-zinc-500">
-                hue {hs.hue.toFixed(2)} · sat {hs.saturation.toFixed(2)}
-                {sending ? " · sending…" : ""}
-              </p>
               {lastSent ? (
                 <p className="text-sm text-teal-200/90">{lastSent}</p>
               ) : null}
               <Button
                 size="lg"
-                className="h-11 w-full bg-teal-400 text-zinc-950 hover:bg-teal-300"
+                className="h-11 w-full bg-teal-400 text-zinc-950 hover:bg-teal-300 sm:w-auto"
                 disabled={sending || demo}
-                onClick={() => void pushEyeColor(hs)}
+                onClick={() => void pushVolume(volume)}
               >
                 {sending ? <Loader2 className="size-4 animate-spin" /> : null}
-                Apply color
-              </Button>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-zinc-950/80">
-            <CardHeader>
-              <CardTitle>{info?.name ?? "Vector"}</CardTitle>
-              <CardDescription>
-                BLE for pairing, Wi-Fi for the color packets. No external
-                servers.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
-              <VectorFace hue={hs.hue} saturation={hs.saturation} paired />
-              <dl className="grid grid-cols-2 gap-3 text-sm">
-                <Info label="Wi-Fi" value={info?.wifiSsid ?? "—"} icon />
-                <Info label="IP" value={info?.ip ?? "—"} />
-                <Info label="Serial" value={info?.esn ?? "—"} />
-                <Info label="Build" value={info?.build ?? "—"} />
-              </dl>
-              {info && !info.wifiConnected ? (
-                <p className="text-sm text-amber-200">
-                  Paired over BLE but not on Wi-Fi. Connect him to your network,
-                  then try again.
-                </p>
-              ) : null}
-              <Button variant="outline" onClick={disconnect}>
-                Disconnect
+                Apply volume
               </Button>
             </CardContent>
           </Card>

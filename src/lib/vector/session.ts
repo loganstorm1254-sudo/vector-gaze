@@ -38,7 +38,7 @@ export type SdkResult = {
   responseType?: string;
   responseBody?: string;
   path: string;
-  via: "console" | "sdk";
+  via: "console";
 };
 
 type RtsHandler = {
@@ -89,8 +89,21 @@ export const EYE_COLOR_ENUM = [
   { name: "Green", enum: "CONFUSION_MATRIX_GREEN", value: 6, hue: 0.3, saturation: 1 },
 ] as const;
 
-// Unlocked / CFW eng console ports (anim owns the face).
+// Unlocked / CFW eng console ports (anim owns face; engine owns settings).
 const CONSOLE_PORTS = [8889, 8888] as const;
+const ENGINE_PORTS = [8888, 8889] as const;
+
+/** RobotSettings master_volume enum (settings.proto Volume). */
+export const VOLUME_LEVELS = [
+  { name: "Mute", value: 0 },
+  { name: "Low", value: 1 },
+  { name: "Medium low", value: 2 },
+  { name: "Medium", value: 3 },
+  { name: "Medium high", value: 4 },
+  { name: "High", value: 5 },
+] as const;
+
+export type VolumeLevel = (typeof VOLUME_LEVELS)[number]["value"];
 
 function generateHandshakeMessage(version: number) {
   return [1].concat(IntBuffer.Int32ToLE(version));
@@ -217,7 +230,7 @@ async function setEyeColorViaLocalProxy(
     const res = await fetch("/api/vector-console", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ip, hue, saturation }),
+      body: JSON.stringify({ ip, action: "eyes", hue, saturation }),
     });
     if (!res.ok) return false;
     const data = (await res.json()) as { ok?: boolean };
@@ -283,6 +296,76 @@ async function setEyeColorViaConsole(
     ]);
 
     if (results.some((r) => r === "ok" || r === "opaque")) anyOk = true;
+  }
+
+  return anyOk;
+}
+
+async function setVolumeViaLocalProxy(
+  ip: string,
+  level: VolumeLevel,
+): Promise<boolean> {
+  if (!isLocalDevHost()) return false;
+  try {
+    const res = await fetch("/api/vector-console", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip, action: "volume", volume: level }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { ok?: boolean };
+    return Boolean(data.ok);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Same path as demoEngine.html on unlocked CFW:
+ * set MasterVolumeLevel, then call DebugSetMasterVolume.
+ * Lives on the engine webserver (:8888).
+ */
+async function setVolumeViaConsole(
+  ip: string,
+  level: VolumeLevel,
+): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+
+  if (await setVolumeViaLocalProxy(ip, level)) {
+    return true;
+  }
+
+  if (!(await probeConsoleReachable(ip))) {
+    return false;
+  }
+
+  let anyOk = false;
+  const keys = ["MasterVolumeLevel", "kMasterVolumeLevel"];
+
+  for (const port of ENGINE_PORTS) {
+    const base = `http://${ip}:${port}`;
+
+    for (const key of keys) {
+      const setUrl = `${base}/consolevarset?key=${encodeURIComponent(key)}&value=${encodeURIComponent(String(level))}`;
+      const applyUrl = `${base}/consolefunccall?func=DebugSetMasterVolume&args=`;
+
+      const results = await Promise.all([
+        hitRobotHttp(setUrl),
+        hitRobotHttp(applyUrl),
+        hitRobotHttp(`${base}/consolevarset`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `key=${encodeURIComponent(key)}&value=${encodeURIComponent(String(level))}`,
+        }),
+        hitRobotHttp(`${base}/consolefunccall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "func=DebugSetMasterVolume&args=",
+        }),
+      ]);
+
+      if (results.some((r) => r === "ok" || r === "opaque")) anyOk = true;
+    }
   }
 
   return anyOk;
@@ -486,9 +569,7 @@ export class VectorSession {
   }
 
   /**
-   * Change eye color with zero cloud / Wire-Pod.
-   * Unlocked CFW: hit Vector's local eng console over LAN.
-   * Fallback: BLE SDK proxy with an empty token (some CFWs allow it).
+   * Change eye color via unlocked CFW local console (no cloud / Wire-Pod).
    */
   async setEyeColor(hue: number, saturation: number): Promise<SdkResult> {
     await this.refreshInfo();
@@ -503,13 +584,44 @@ export class VectorSession {
     const ok = await setEyeColorViaConsole(ip, hue, saturation);
     if (!ok) {
       throw new Error(
-        `Couldn’t reach Vector at ${ip}:8889. Same Wi-Fi required. In Chrome click Allow for local network access (Vercel HTTPS → robot). No guid / Escape Pod needed — this build only uses his unlocked CFW console.`,
+        `Couldn’t reach Vector at ${ip}:8889. Same Wi-Fi required. In Chrome click Allow for local network access (Vercel HTTPS → robot).`,
       );
     }
 
     return {
       statusCode: 200,
       path: "/consolefunccall",
+      via: "console",
+    };
+  }
+
+  /**
+   * Change master volume via unlocked CFW engine console (DebugSetMasterVolume).
+   */
+  async setVolume(level: VolumeLevel): Promise<SdkResult> {
+    if (!Number.isInteger(level) || level < 0 || level > 5) {
+      throw new Error("Volume must be an integer from 0 (mute) to 5 (high).");
+    }
+
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try volume again.",
+      );
+    }
+
+    const ok = await setVolumeViaConsole(ip, level);
+    if (!ok) {
+      throw new Error(
+        `Couldn’t reach Vector’s engine console at ${ip}:8888 for volume. Same Wi-Fi + Allow local network access.`,
+      );
+    }
+
+    return {
+      statusCode: 200,
+      path: "/consolefunccall?func=DebugSetMasterVolume",
       via: "console",
     };
   }

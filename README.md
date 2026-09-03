@@ -1,10 +1,13 @@
-# Vector Eye Color
+# Vector Eyes & Volume
 
-Pair an unlocked / CFW [Anki Vector](https://www.digitaldreamlabs.com/) over Bluetooth, then paint his eyes from an RGB wheel.
+Pair an unlocked / CFW [Anki Vector](https://www.digitaldreamlabs.com/) over Bluetooth, then paint his eyes and set speaker volume.
 
 **Deploy on Vercel.** No Wire-Pod. No Anki cloud. No Escape Pod.
 
-After the backpack PIN, the page reads Vector’s Wi-Fi IP over BLE and sets `ProcFace_Hue` / `ProcFace_Saturation` on his onboard eng console (`:8889`). Color stays on your LAN.
+After the backpack PIN, the page reads Vector’s Wi-Fi IP over BLE and talks to his onboard eng console on your LAN:
+
+- Eyes — `ProcFace_Hue` / `ProcFace_Saturation` on `:8889`
+- Volume — `MasterVolumeLevel` + `DebugSetMasterVolume` on `:8888`
 
 ## Deploy on Vercel
 
@@ -23,15 +26,15 @@ When Chrome asks **“Allow this site to access your local network?”** — cli
 2. Double-click the backpack — key icon + 6-digit PIN.
 3. **Find Vector** → enter the PIN.
 4. Click **Allow** on the local-network prompt if Chrome shows it.
-5. Drag the RGB wheel. Stay on the **same Wi-Fi** as Vector.
+5. Drag the RGB wheel or tap a volume level. Stay on the **same Wi-Fi** as Vector.
 
 ## How it works
 
 1. **BLE** — PIN unlocks RTS and reads his IP.
 2. **LAN from the browser** — with Chrome Local Network Access granted:
-   - `http://<vector-ip>:8889/consolefunccall?func=ProcFace_Hue&args=…`
-   - `http://<vector-ip>:8889/consolefunccall?func=ProcFace_Saturation&args=…`
-3. Those are the unlocked CFW face hooks. No SDK guid. No cloud mint.
+   - Eyes: `http://<vector-ip>:8889/consolefunccall?func=ProcFace_Hue&args=…` (+ Saturation)
+   - Volume: set `MasterVolumeLevel` / `kMasterVolumeLevel` (0–5), then `DebugSetMasterVolume` on `:8888`
+3. Unlocked CFW console hooks only. No SDK guid. No cloud mint.
 
 ## Run locally (optional)
 
