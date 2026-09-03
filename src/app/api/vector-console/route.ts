@@ -163,25 +163,35 @@ async function setOverlay(ip: string, flavor: number | null, opacity: number) {
  * Write /data/data/customFaceOverlay.jpg using the public unlocked-Vector root key.
  * No user password / SCP — works whenever this Next process can reach the robot LAN.
  */
-async function uploadOverlayJpeg(ip: string, jpegBase64: string) {
+async function uploadOverlayJpeg(
+  ip: string,
+  jpegBase64: string,
+  bridgeBase64?: string,
+) {
   const bytes = Buffer.from(jpegBase64, "base64");
   if (bytes.byteLength < 32) {
     return { ok: false, tried: 0, error: "JPEG payload too small" };
   }
 
+  const bridge =
+    typeof bridgeBase64 === "string" && bridgeBase64.length > 16
+      ? Buffer.from(bridgeBase64, "base64")
+      : undefined;
+
   // Dynamic import keeps ssh2 out of the Turbopack graph at build time.
   const { uploadOverlayViaUnlockSsh } = await import("@/lib/vector/ssh-upload");
-  const ssh = await uploadOverlayViaUnlockSsh(ip, bytes);
+  const ssh = await uploadOverlayViaUnlockSsh(ip, bytes, bridge);
   if (ssh.ok) {
     return { ok: true, tried: 1, via: "unlock-ssh" as const, path: ssh.path };
   }
 
   // Fallback: HTTP PUT into eng-console rewrite paths (same LAN).
+  // Caller must not treat this as flavor-8 Custom — only as staging.
   let putOk = false;
   let tried = 0;
   const paths = [
-    "/persistent/customFaceOverlay.jpg",
     "/resources/assets/faceOverlays/galaxy.jpg",
+    "/persistent/customFaceOverlay.jpg",
     "/cache/customFaceOverlay.jpg",
   ];
   for (const port of ANIM_PORTS) {
@@ -224,6 +234,7 @@ export async function POST(request: Request) {
     flavor?: number | null;
     opacity?: number;
     jpegBase64?: string;
+    bridgeBase64?: string;
   };
   try {
     body = await request.json();
@@ -286,7 +297,11 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
-    const result = await uploadOverlayJpeg(ip, jpegBase64);
+    const result = await uploadOverlayJpeg(
+      ip,
+      jpegBase64,
+      typeof body.bridgeBase64 === "string" ? body.bridgeBase64 : undefined,
+    );
     return NextResponse.json({ ip, action, ...result });
   }
 

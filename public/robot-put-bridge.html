@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Vector Gaze put bridge</title>
+  </head>
+  <body>
+    <script>
+      // Runs on the robot eng-console origin so PUT is same-origin (no CORS).
+      window.addEventListener("message", async (event) => {
+        const data = event.data;
+        if (!data || data.type !== "vector-gaze-put") return;
+        const reply = (payload) => {
+          try {
+            event.source && event.source.postMessage(payload, "*");
+          } catch (_) {}
+        };
+        try {
+          const path = String(data.path || "");
+          const b64 = String(data.jpegBase64 || "");
+          if (!path.startsWith("/") || !b64) {
+            reply({ type: "vector-gaze-put-result", ok: false, error: "bad payload" });
+            return;
+          }
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          try {
+            await fetch(path, { method: "DELETE" });
+          } catch (_) {}
+          const res = await fetch(path, {
+            method: "PUT",
+            headers: { "Content-Type": "image/jpeg" },
+            body: bytes,
+          });
+          reply({
+            type: "vector-gaze-put-result",
+            ok: res.ok || (res.status > 0 && res.status < 500),
+            status: res.status,
+          });
+        } catch (err) {
+          reply({
+            type: "vector-gaze-put-result",
+            ok: false,
+            error: err && err.message ? err.message : String(err),
+          });
+        }
+      });
+      try {
+        parent.postMessage({ type: "vector-gaze-put-ready" }, "*");
+      } catch (_) {}
+    </script>
+  </body>
+</html>

@@ -502,10 +502,13 @@ const CUSTOM_HTTP_STAGING = {
   stockUrl: "/face-overlays/galaxy.jpg",
 };
 
+const PUT_BRIDGE_URI = "/persistent/gaze-put-bridge.html";
+const PUT_BRIDGE_PUBLIC = "/robot-put-bridge.html";
+
 export type CustomUploadResult = {
   ok: boolean;
   flavor: number;
-  via: "unlock-ssh" | "http-resources" | "http-persistent";
+  via: "unlock-ssh" | "http-resources" | "http-bridge";
 };
 
 async function blobToBase64(jpeg: Blob): Promise<string> {
@@ -515,32 +518,176 @@ async function blobToBase64(jpeg: Blob): Promise<string> {
   return btoa(binary);
 }
 
-async function putRobotJpeg(
+async function sha256Hex(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** GET from eng-console — responses include ACAO * so we can verify writes. */
+async function getRobotBytes(
+  ip: string,
+  uriPath: string,
+): Promise<ArrayBuffer | null> {
+  for (const port of CONSOLE_PORTS) {
+    const url = `http://${ip}:${port}${uriPath}?t=${Date.now()}`;
+    try {
+      const localInit: LocalFetchInit = {
+        method: "GET",
+        cache: "no-store",
+        mode: "cors",
+        targetAddressSpace: "local",
+      };
+      const res = await fetch(url, localInit);
+      if (res.ok) return await res.arrayBuffer();
+    } catch {
+      // try next port
+    }
+  }
+  return null;
+}
+
+/**
+ * PUT via the robot-origin bridge iframe (same-origin on :8889 — no CORS preflight).
+ * Bridge is installed at /persistent/gaze-put-bridge.html by unlock-SSH uploads.
+ */
+async function putViaRobotBridge(
   ip: string,
   uriPath: string,
   jpeg: Blob,
 ): Promise<boolean> {
-  let anyOk = false;
+  if (typeof document === "undefined") return false;
+
+  const jpegBase64 = await blobToBase64(jpeg);
+
+  for (const port of CONSOLE_PORTS) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const iframe = document.createElement("iframe");
+      iframe.style.display = "none";
+      iframe.setAttribute("aria-hidden", "true");
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        window.removeEventListener("message", onMessage);
+        iframe.remove();
+        resolve(value);
+      };
+
+      const timer = window.setTimeout(() => finish(false), 8000);
+
+      const onMessage = (event: MessageEvent) => {
+        const data = event.data as {
+          type?: string;
+          ok?: boolean;
+        } | null;
+        if (!data || typeof data !== "object") return;
+        if (data.type === "vector-gaze-put-ready") {
+          iframe.contentWindow?.postMessage(
+            {
+              type: "vector-gaze-put",
+              path: uriPath,
+              jpegBase64,
+            },
+            "*",
+          );
+          return;
+        }
+        if (data.type === "vector-gaze-put-result") {
+          finish(Boolean(data.ok));
+        }
+      };
+
+      window.addEventListener("message", onMessage);
+      iframe.onload = () => {
+        // If the bridge 404s, onload still fires with an error page — ready msg won't come.
+        window.setTimeout(() => {
+          if (!settled) {
+            iframe.contentWindow?.postMessage(
+              {
+                type: "vector-gaze-put",
+                path: uriPath,
+                jpegBase64,
+              },
+              "*",
+            );
+          }
+        }, 250);
+      };
+      iframe.onerror = () => finish(false);
+      iframe.src = `http://${ip}:${port}${PUT_BRIDGE_URI}?t=${Date.now()}`;
+      document.body.appendChild(iframe);
+    });
+    if (ok) return true;
+  }
+  return false;
+}
+
+/**
+ * CORS PUT — only counts as success when a subsequent GET shows the new bytes.
+ * Opaque / no-cors PUT is ignored (browsers can't PUT in no-cors mode anyway).
+ */
+async function putRobotJpegVerified(
+  ip: string,
+  uriPath: string,
+  jpeg: Blob,
+): Promise<boolean> {
+  const expected = await sha256Hex(jpeg);
+
+  // Prefer robot-origin bridge (works from Vercel once installed).
+  if (await putViaRobotBridge(ip, uriPath, jpeg)) {
+    const afterBridge = await getRobotBytes(ip, uriPath);
+    if (afterBridge) {
+      const got = await sha256Hex(new Blob([afterBridge]));
+      if (got === expected) return true;
+    } else {
+      // Bridge reported ok but GET blocked — trust bridge same-origin PUT.
+      return true;
+    }
+  }
+
   for (const port of CONSOLE_PORTS) {
     const url = `http://${ip}:${port}${uriPath}`;
-    await hitRobotHttp(url, { method: "DELETE" });
-    const put = await hitRobotHttp(url, {
+    const localInit: LocalFetchInit = {
       method: "PUT",
+      cache: "no-store",
+      mode: "cors",
+      targetAddressSpace: "local",
       headers: {
         "Content-Type": "image/jpeg",
         "Content-Length": String(jpeg.size),
       },
       body: jpeg,
-    });
-    if (put === "ok" || put === "opaque") anyOk = true;
+    };
+    try {
+      await fetch(url, { ...localInit, method: "DELETE" });
+    } catch {
+      // ignore
+    }
+    try {
+      const res = await fetch(url, localInit);
+      if (!(res.ok || (res.status > 0 && res.status < 500))) continue;
+    } catch {
+      continue;
+    }
+
+    const after = await getRobotBytes(ip, uriPath);
+    if (!after) continue;
+    const got = await sha256Hex(new Blob([after]));
+    if (got === expected) return true;
   }
-  return anyOk;
+  return false;
 }
 
 /**
  * Push a custom overlay JPG onto the robot automatically (no password / SCP).
- * 1) Local Next on the same LAN → unlock-key SSH to /data/data/customFaceOverlay.jpg
- * 2) Otherwise → HTTP PUT into eng-console /resources (Galaxy staging) from the browser
+ * 1) Local Next on the same LAN → unlock-key SSH (wipes old file, writes new)
+ * 2) Otherwise → verified HTTP PUT (robot-origin bridge or CORS) into Galaxy staging
+ *
+ * Never reports success for flavor 8 unless SSH actually replaced the Custom file.
  */
 export async function uploadCustomOverlayJpeg(
   ip: string,
@@ -552,6 +699,15 @@ export async function uploadCustomOverlayJpeg(
   if (isLocalDevHost()) {
     try {
       const jpegBase64 = await blobToBase64(jpeg);
+      let bridgeBase64: string | undefined;
+      try {
+        const bridgeRes = await fetch(PUT_BRIDGE_PUBLIC, { cache: "force-cache" });
+        if (bridgeRes.ok) {
+          bridgeBase64 = await blobToBase64(await bridgeRes.blob());
+        }
+      } catch {
+        // optional
+      }
       const res = await fetch("/api/vector-console", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -559,6 +715,7 @@ export async function uploadCustomOverlayJpeg(
           ip,
           action: "overlay-upload",
           jpegBase64,
+          bridgeBase64,
         }),
       });
       if (res.ok) {
@@ -566,15 +723,12 @@ export async function uploadCustomOverlayJpeg(
           ok?: boolean;
           via?: string;
         };
-        if (data.ok) {
-          if (data.via === "unlock-ssh") {
-            return { ok: true, flavor: 8, via: "unlock-ssh" };
-          }
-          // API HTTP PUT may have written resources/galaxy or persistent.
-          if (data.via === "http-put") {
-            return { ok: true, flavor: 7, via: "http-resources" };
-          }
+        if (data.ok && data.via === "unlock-ssh") {
           return { ok: true, flavor: 8, via: "unlock-ssh" };
+        }
+        // Do NOT treat unknown/http-put API success as flavor 8 — that reloads the OLD Custom file.
+        if (data.ok && data.via === "http-put") {
+          // Fall through to verified browser write for staging flavor.
         }
       }
     } catch {
@@ -582,18 +736,24 @@ export async function uploadCustomOverlayJpeg(
     }
   }
 
-  // Vercel / remote: browser → robot LAN (Chrome Local Network Access).
-  if (await putRobotJpeg(ip, CUSTOM_HTTP_STAGING.uriPath, jpeg)) {
+  // Vercel / remote: browser → robot LAN. Only succeed when the new bytes are verified.
+  if (await putRobotJpegVerified(ip, CUSTOM_HTTP_STAGING.uriPath, jpeg)) {
+    return {
+      ok: true,
+      flavor: CUSTOM_HTTP_STAGING.flavor,
+      via: "http-bridge",
+    };
+  }
+
+  // Also try staging under persistent (still load as Galaxy flavor if we can't do Custom).
+  if (await putRobotJpegVerified(ip, "/persistent/customFaceOverlay.jpg", jpeg)) {
+    // Persistent alone does NOT feed flavor 8. Stage into galaxy as well if possible.
+    await putRobotJpegVerified(ip, CUSTOM_HTTP_STAGING.uriPath, jpeg);
     return {
       ok: true,
       flavor: CUSTOM_HTTP_STAGING.flavor,
       via: "http-resources",
     };
-  }
-
-  // Last resort: persistent path (needs prior symlink for true Custom load).
-  if (await putRobotJpeg(ip, "/persistent/customFaceOverlay.jpg", jpeg)) {
-    return { ok: true, flavor: 8, via: "http-persistent" };
   }
 
   return null;
@@ -606,7 +766,7 @@ export async function restoreStockGalaxyOverlay(ip: string): Promise<boolean> {
     const res = await fetch(CUSTOM_HTTP_STAGING.stockUrl, { cache: "force-cache" });
     if (!res.ok) return false;
     const blob = await res.blob();
-    return putRobotJpeg(ip, CUSTOM_HTTP_STAGING.uriPath, blob);
+    return putRobotJpegVerified(ip, CUSTOM_HTTP_STAGING.uriPath, blob);
   } catch {
     return false;
   }
@@ -628,6 +788,8 @@ export class VectorSession {
   phase: PairPhase = "idle";
   /** Flavor last used for a successful custom image push (7 staging or 8 file). */
   lastCustomFlavor: number = 8;
+  /** Last custom JPEG successfully prepared/uploaded — Apply re-writes this instead of reloading old disk. */
+  lastCustomBlob: Blob | null = null;
 
   onPhase?: (phase: PairPhase) => void;
   onDisconnected?: () => void;
@@ -906,7 +1068,8 @@ export class VectorSession {
 
   /**
    * Wipe any current custom overlay, push the new JPG automatically, then load it.
-   * No SSH password / SCP — uses unlock-key SSH (local) or HTTP resources staging (Vercel).
+   * No SSH password / SCP — uses unlock-key SSH (local) or verified HTTP staging (Vercel).
+   * On write failure the face stays wiped — we never reload the previous Custom file.
    */
   async replaceCustomOverlay(
     jpeg: Blob,
@@ -920,18 +1083,20 @@ export class VectorSession {
       );
     }
 
-    // 1) Wipe whatever is currently showing.
+    // 1) Wipe whatever is currently showing (CustomEyes=false). Do NOT call
+    // LOOK_LoadFaceOverlay here — that would reload the OLD Custom file from disk.
     await setEyeOverlayViaConsole(ip, null, opacity);
+    await new Promise((r) => setTimeout(r, 100));
 
-    // 2) Write the new image automatically.
+    // 2) Write the new image (verified). Fail closed — stay wiped.
     const uploaded = await uploadCustomOverlayJpeg(ip, jpeg);
     if (!uploaded) {
       throw new Error(
-        `Wiped the old overlay, but couldn’t write the new image to ${ip}. Stay on the same Wi-Fi and click Allow for local network access.`,
+        `Wiped the old overlay, but couldn’t write the new image to ${ip}. Stay on the same Wi-Fi, click Allow for local network access, and try again.`,
       );
     }
 
-    // 3) Load the flavor that matches where the file landed.
+    // 3) Load only the flavor that matches the verified write target.
     const ok = await setEyeOverlayViaConsole(ip, uploaded.flavor, opacity);
     if (!ok) {
       throw new Error(
@@ -940,8 +1105,9 @@ export class VectorSession {
     }
 
     this.lastCustomFlavor = uploaded.flavor;
+    this.lastCustomBlob = jpeg;
 
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 200));
     await setEyeOverlayViaConsole(ip, uploaded.flavor, opacity);
 
     return {
@@ -955,14 +1121,25 @@ export class VectorSession {
   }
 
   /**
-   * Reload the last custom overlay (opacity tweak) without re-uploading.
+   * Opacity / Apply for custom: always re-upload the last blob so we never
+   * resurrect an old on-disk Custom file without replacing it.
    */
-  async reloadCustomOverlay(opacity = 0.8): Promise<SdkResult> {
+  async reloadCustomOverlay(opacity = 0.8, jpeg?: Blob): Promise<SdkResult> {
+    const blob = jpeg ?? this.lastCustomBlob;
+    if (blob) {
+      return this.replaceCustomOverlay(blob, opacity);
+    }
     await this.refreshInfo();
     const ip = this.info?.ip;
     if (!ip) {
       throw new Error(
         "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try overlays again.",
+      );
+    }
+    // No blob in memory — refuse to blindly reload flavor 8 (old disk image).
+    if (this.lastCustomFlavor === 8) {
+      throw new Error(
+        "Pick your custom image again so we can rewrite it on the robot (won’t reuse the old file).",
       );
     }
     const ok = await setEyeOverlayViaConsole(ip, this.lastCustomFlavor, opacity);

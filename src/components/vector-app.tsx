@@ -276,8 +276,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
           "Old custom wiped — new image written and loaded on his face.",
         );
       } else if (id === "custom") {
-        await session.reloadCustomOverlay(opacity);
-        setLastSent("Custom overlay reloaded.");
+        await session.reloadCustomOverlay(opacity, prepared?.blob);
+        setLastSent("Custom overlay rewritten and loaded.");
       } else if (id === "galaxy") {
         await session.setGalaxyOverlay(opacity);
         setLastSent("Galaxy overlay loaded via Face console — no servers.");
@@ -723,7 +723,8 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                   disabled={sending || demo || overlayId === "off"}
                   onClick={() =>
                     void pushOverlay(overlayId, overlayOpacity, customPreview, {
-                      replaceCustom: false,
+                      // Always rewrite custom from the picked image — never reload a stale on-disk JPG.
+                      replaceCustom: overlayId === "custom",
                     })
                   }
                 >
