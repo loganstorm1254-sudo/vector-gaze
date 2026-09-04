@@ -32,9 +32,9 @@
   <body>
     <div class="card">
       <strong>Vector Gaze</strong>
-      <p id="status">Waiting…</p>
-    </div>
-    <script>
+        <p id="status">Waiting...</p>
+      </div>
+      <script>
       const statusEl = document.getElementById("status");
       const setStatus = (text, cls) => {
         statusEl.textContent = text;
@@ -58,7 +58,7 @@
           body: bytes,
         });
         if (!(res.ok || res.status === 201)) {
-          throw new Error("PUT " + path + " → " + res.status);
+          throw new Error("PUT " + path + " -> " + res.status);
         }
       };
 
@@ -148,11 +148,11 @@
           return;
         }
         try {
-          setStatus("Writing overlay on Vector…");
+          setStatus("Writing overlay on Vector...");
           const raw = decodeURIComponent(hash.slice("#gaze=".length));
           const payload = JSON.parse(raw);
           await writeOverlay({ ...payload, load: payload.load !== false });
-          setStatus("Done — overlay written. You can close this tab.", "ok");
+          setStatus("Done - overlay written. You can close this tab.", "ok");
           try {
             if (window.opener) {
               window.opener.postMessage(

@@ -20,7 +20,7 @@ export class RobotWriteSetupError extends Error {
     bridgeWriteUrl: string,
   ) {
     super(
-      `Chrome blocks file writes from this site to Vector’s eng console. Use the Vector Gaze Write bookmark once on his :8889 page, then retry.`,
+      `Chrome blocks file writes from this site to Vector's eng console. Use the Vector Gaze Write bookmark once on his :8889 page, then retry.`,
     );
     this.name = "RobotWriteSetupError";
     this.ip = ip;
@@ -42,8 +42,18 @@ export function isRobotWriteSetupError(
   );
 }
 
-/** Compact bridge HTML inlined into the first-time bookmarklet. */
-const INLINE_BRIDGE_HTML = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Vector Gaze writer</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;font:15px/1.45 ui-sans-serif,system-ui,sans-serif;color:#ecfdf5;background:#09090b}.card{max-width:28rem;padding:1.25rem 1.5rem;border:1px solid rgba(45,212,191,.25);border-radius:1rem;background:rgba(24,24,27,.92)}.ok{color:#5eead4}.err{color:#fecaca}</style></head><body><div class="card"><strong>Vector Gaze</strong><p id="status">Waiting…</p></div><script>
+/** Encode a JS string as base64 (UTF-8 safe — plain btoa fails on …/—/etc). */
+function btoaUtf8(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(binary);
+}
+
+/** Compact bridge HTML inlined into the first-time bookmarklet (ASCII-only). */
+const INLINE_BRIDGE_HTML = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Vector Gaze writer</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;font:15px/1.45 ui-sans-serif,system-ui,sans-serif;color:#ecfdf5;background:#09090b}.card{max-width:28rem;padding:1.25rem 1.5rem;border:1px solid rgba(45,212,191,.25);border-radius:1rem;background:rgba(24,24,27,.92)}.ok{color:#5eead4}.err{color:#fecaca}</style></head><body><div class="card"><strong>Vector Gaze</strong><p id="status">Waiting...</p></div><script>
 const statusEl=document.getElementById("status");const setStatus=(t,c)=>{statusEl.textContent=t;statusEl.className=c||""};
 const decodeB64=b64=>{const bin=atob(b64);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u};
 const putBytes=async(path,bytes,type)=>{try{await fetch(path,{method:"DELETE"})}catch(_){}const r=await fetch(path,{method:"PUT",headers:{"Content-Type":type||"application/octet-stream"},body:bytes});if(!(r.ok||r.status===201))throw new Error("PUT "+path+" -> "+r.status)};
@@ -51,7 +61,7 @@ const fireConsole=async u=>{try{await fetch(u,{method:"GET",mode:"no-cors"})}cat
 const writeOverlay=async payload=>{const path=String(payload.path||"/resources/assets/faceOverlays/galaxy.jpg");const b64=String(payload.jpegBase64||"");if(!path.startsWith("/")||!b64)throw new Error("bad payload");const jpeg=decodeB64(b64);await putBytes(path,jpeg,"image/jpeg");try{await putBytes("/persistent/customFaceOverlay.jpg",jpeg,"image/jpeg")}catch(_){}if(payload.load){const op=Number.isFinite(Number(payload.opacity))?Number(payload.opacity):0.8;const fl=Number.isFinite(Number(payload.flavor))?Number(payload.flavor):7;await fireConsole("/consolevarset?key=kProcFace_CustomEyes&value=true");await fireConsole("/consolevarset?key=kProcFace_FlavorOfGay&value="+encodeURIComponent(String(fl)));await fireConsole("/consolevarset?key=kProcFace_CustomEyeOpacity&value="+encodeURIComponent(String(op)));await fireConsole("/consolefunccall?func=LOOK_LoadFaceOverlay&args=")} };
 window.addEventListener("message",async e=>{const d=e.data;if(!d||d.type!=="vector-gaze-put")return;const reply=p=>{try{e.source&&e.source.postMessage(p,"*")}catch(_){}};try{await writeOverlay({path:d.path,jpegBase64:d.jpegBase64,load:false});reply({type:"vector-gaze-put-result",ok:true,status:200})}catch(err){reply({type:"vector-gaze-put-result",ok:false,error:String(err&&err.message||err)})}});
 try{parent.postMessage({type:"vector-gaze-put-ready"},"*")}catch(_){}
-(async()=>{const hash=location.hash||"";if(!hash.startsWith("#gaze=")){setStatus("Write helper ready on Vector.");return}try{setStatus("Writing overlay on Vector…");const payload=JSON.parse(decodeURIComponent(hash.slice(6)));await writeOverlay(Object.assign({},payload,{load:payload.load!==false}));setStatus("Done — overlay written. You can close this tab.","ok");try{window.opener&&window.opener.postMessage({type:"vector-gaze-write-done",ok:true},"*")}catch(_){}setTimeout(()=>{try{window.close()}catch(_){}},1200)}catch(err){const msg=String(err&&err.message||err);setStatus("Write failed: "+msg,"err");try{window.opener&&window.opener.postMessage({type:"vector-gaze-write-done",ok:false,error:msg},"*")}catch(_){}}})();
+(async()=>{const hash=location.hash||"";if(!hash.startsWith("#gaze=")){setStatus("Write helper ready on Vector.");return}try{setStatus("Writing overlay on Vector...");const payload=JSON.parse(decodeURIComponent(hash.slice(6)));await writeOverlay(Object.assign({},payload,{load:payload.load!==false}));setStatus("Done - overlay written. You can close this tab.","ok");try{window.opener&&window.opener.postMessage({type:"vector-gaze-write-done",ok:true},"*")}catch(_){}setTimeout(()=>{try{window.close()}catch(_){}},1200)}catch(err){const msg=String(err&&err.message||err);setStatus("Write failed: "+msg,"err");try{window.opener&&window.opener.postMessage({type:"vector-gaze-write-done",ok:false,error:msg},"*")}catch(_){}}})();
 </script></body></html>`;
 
 export type GazeWritePayload = {
@@ -75,7 +85,7 @@ export function buildRobotWriteSetupScript(
   jpegBase64: string,
   opacity = 0.8,
 ): string {
-  const bridgeB64 = btoa(INLINE_BRIDGE_HTML);
+  const bridgeB64 = btoaUtf8(INLINE_BRIDGE_HTML);
   return `(async()=>{const J=${JSON.stringify(jpegBase64)};const B=${JSON.stringify(bridgeB64)};const dec=s=>{const b=atob(s);const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u};const put=async(p,bytes,type)=>{try{await fetch(p,{method:"DELETE"})}catch(_){}const r=await fetch(p,{method:"PUT",headers:{"Content-Type":type},body:bytes});if(!(r.ok||r.status===201))throw new Error("PUT "+p+" -> "+r.status)};const jpeg=dec(J);const bridge=dec(B);await put("/persistent/gaze-put-bridge.html",bridge,"text/html");let staged=false;try{await put("/resources/assets/faceOverlays/galaxy.jpg",jpeg,"image/jpeg");staged=true}catch(e){console.warn("galaxy staging failed",e)}try{await put("/persistent/customFaceOverlay.jpg",jpeg,"image/jpeg")}catch(e){console.warn("persistent staging failed",e)}if(!staged)throw new Error("Could not write overlay JPG (resources may be read-only). Run npm run dev on the same Wi-Fi once.");const q=async(u)=>{try{await fetch(u,{method:"GET",mode:"no-cors"})}catch(_){};try{await fetch(u,{method:"POST",mode:"no-cors",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:""})}catch(_){}};await q("/consolevarset?key=kProcFace_CustomEyes&value=true");await q("/consolevarset?key=kProcFace_FlavorOfGay&value=7");await q("/consolevarset?key=kProcFace_CustomEyeOpacity&value=${opacity}");await q("/consolefunccall?func=LOOK_LoadFaceOverlay&args=");document.title="Vector Gaze: done";alert("Vector Gaze installed the write helper and loaded your overlay. Go back to the site — future images open a Vector tab that writes automatically.")})()`;
 }
 
