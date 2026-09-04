@@ -1,7 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bluetooth, ImageIcon, KeyRound, Loader2, Volume2, Wifi } from "lucide-react";
+import {
+  Bluetooth,
+  Hand,
+  ImageIcon,
+  KeyRound,
+  Loader2,
+  Volume2,
+  Wifi,
+} from "lucide-react";
 
 import { ColorWheel } from "@/components/color-wheel";
 import { VectorFace } from "@/components/vector-face";
@@ -24,11 +32,12 @@ import {
   type PreparedOverlayJpeg,
 } from "@/lib/vector/overlay";
 import {
-  beginRobotWriteSetup,
   bluetoothSupported,
+  copyText,
   ensureLocalNetworkAccess,
   EYE_COLOR_ENUM,
   isRobotWriteSetupError,
+  openBridgeWriteTab,
   VOLUME_LEVELS,
   VectorSession,
   type PairPhase,
@@ -41,7 +50,9 @@ type UiPhase = "landing" | "pin" | "eyes";
 type WriteSetupState = {
   ip: string;
   setupScript: string;
+  bookmarkletHref: string;
   robotPageUrl: string;
+  bridgeWriteUrl: string;
   copied: boolean;
 };
 
@@ -302,12 +313,14 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       setWriteSetup(null);
     } catch (err) {
       if (isRobotWriteSetupError(err)) {
-        const started = await beginRobotWriteSetup(err.ip, err.setupScript);
+        const copied = await copyText(err.setupScript);
         setWriteSetup({
           ip: err.ip,
           setupScript: err.setupScript,
-          robotPageUrl: started.robotPageUrl,
-          copied: started.copied,
+          bookmarkletHref: err.bookmarkletHref,
+          robotPageUrl: err.robotPageUrl,
+          bridgeWriteUrl: err.bridgeWriteUrl,
+          copied,
         });
         setError(null);
         setLastSent(null);
@@ -322,25 +335,80 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
     }
   }
 
-  async function runWriteSetupAgain() {
+  async function copyWriteSetupCommand() {
     if (!writeSetup) return;
-    const started = await beginRobotWriteSetup(
-      writeSetup.ip,
-      writeSetup.setupScript,
-    );
-    setWriteSetup({
-      ...writeSetup,
-      copied: started.copied,
-      robotPageUrl: started.robotPageUrl,
-    });
+    const copied = await copyText(writeSetup.setupScript);
+    setWriteSetup({ ...writeSetup, copied });
+  }
+
+  async function openVectorForWriteSetup() {
+    if (!writeSetup) return;
+    window.open(writeSetup.robotPageUrl, "vector-gaze-robot-setup");
+  }
+
+  async function tryBridgeWriteTab() {
+    if (!writeSetup) return;
+    setSending(true);
+    setLastSent("Opening Vector write tab…");
+    try {
+      const ok = await openBridgeWriteTab(writeSetup.bridgeWriteUrl);
+      if (ok) {
+        setWriteSetup(null);
+        setLastSent("Custom overlay written from the Vector tab.");
+        setOverlayId("custom");
+        return;
+      }
+      setLastSent(
+        "Write helper not on Vector yet — use the bookmark once, then Retry.",
+      );
+    } finally {
+      setSending(false);
+    }
   }
 
   async function retryCustomAfterSetup() {
     if (!customPreview) return;
+    // Prefer the bridge tab if install already happened.
+    if (writeSetup) {
+      setSending(true);
+      try {
+        const ok = await openBridgeWriteTab(writeSetup.bridgeWriteUrl);
+        if (ok) {
+          setWriteSetup(null);
+          setLastSent("Custom overlay written from the Vector tab.");
+          setOverlayId("custom");
+          return;
+        }
+      } finally {
+        setSending(false);
+      }
+    }
     setWriteSetup(null);
     await pushOverlay("custom", overlayOpacity, customPreview, {
       replaceCustom: true,
     });
+  }
+
+  async function pushFistBump() {
+    const session = sessionRef.current;
+    if (demo) {
+      setLastSent("Preview only — connect a real Vector to fist bump.");
+      return;
+    }
+    if (!session) return;
+    setSending(true);
+    setLastSent("Asking Vector for a fist bump…");
+    try {
+      await session.fistBump();
+      setLastSent("Fist bump — raise your hand to his lift.");
+      setError(null);
+      setInfo(session.info);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not fist bump.");
+      setLastSent(null);
+    } finally {
+      setSending(false);
+    }
   }
 
   async function onPickCustomImage(file: File | null) {
@@ -408,41 +476,69 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
       {writeSetup ? (
         <div className="rounded-xl border border-amber-500/30 bg-amber-950/40 px-4 py-4 text-sm text-amber-50">
           <p className="font-medium text-amber-100">
-            One-time write setup for {writeSetup.ip}
+            One-time write helper for {writeSetup.ip}
           </p>
           <p className="mt-2 text-amber-100/85">
-            Chrome blocks websites from writing files straight to Vector’s eng
-            console. Paste the setup command on Vector’s own page once — then
-            custom overlays from this site are automatic.
+            Chrome blocks websites from writing files to Vector’s eng console.
+            Run this bookmark <span className="font-semibold">on his page</span>{" "}
+            once — after that, custom images open a Vector tab that writes by
+            itself (no empty Anki Webservices tab).
           </p>
-          <ol className="mt-3 list-decimal space-y-1 pl-5 text-amber-100/90">
+          <ol className="mt-3 list-decimal space-y-2 pl-5 text-amber-100/90">
             <li>
-              Vector’s page should be open at{" "}
+              Drag this to your bookmarks bar:{" "}
               <a
+                className="rounded bg-amber-200 px-2 py-1 font-medium text-zinc-950 no-underline"
+                href={writeSetup.bookmarkletHref}
+                onClick={(event) => {
+                  event.preventDefault();
+                }}
+              >
+                Vector Gaze Write
+              </a>
+            </li>
+            <li>
+              Open{" "}
+              <button
+                type="button"
                 className="underline decoration-amber-300/50 underline-offset-2"
-                href={writeSetup.robotPageUrl}
-                target="_blank"
-                rel="noreferrer"
+                onClick={() => void openVectorForWriteSetup()}
               >
                 {writeSetup.robotPageUrl}
-              </a>
-              {writeSetup.copied ? " (command already copied)." : "."}
+              </button>
+              , then click that bookmark.
             </li>
-            <li>
-              On that page press <span className="font-mono">F12</span> (or{" "}
-              <span className="font-mono">⌘⌥J</span>), open Console, paste,
-              Enter.
-            </li>
-            <li>Come back here and hit Retry.</li>
+            <li>Come back here and hit Retry (or “Open write tab”).</li>
           </ol>
-          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+          <p className="mt-2 text-xs text-amber-100/70">
+            Prefer Console paste?{" "}
+            {writeSetup.copied
+              ? "Command is copied — F12 → Console → paste → Enter on the Vector tab."
+              : "Copy the command, then F12 → Console → paste → Enter on the Vector tab."}
+          </p>
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             <Button
               type="button"
               variant="secondary"
               className="bg-amber-200 text-zinc-950 hover:bg-amber-100"
-              onClick={() => void runWriteSetupAgain()}
+              onClick={() => void openVectorForWriteSetup()}
             >
-              Open Vector page &amp; copy command
+              Open Vector :8889
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => void copyWriteSetupCommand()}
+            >
+              {writeSetup.copied ? "Copied setup command" : "Copy setup command"}
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={sending}
+              onClick={() => void tryBridgeWriteTab()}
+            >
+              Open write tab
             </Button>
             <Button
               type="button"
@@ -450,9 +546,7 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
               disabled={sending || !customPreview}
               onClick={() => void retryCustomAfterSetup()}
             >
-              {sending ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : null}
+              {sending ? <Loader2 className="size-4 animate-spin" /> : null}
               Retry custom overlay
             </Button>
           </div>
@@ -619,6 +713,20 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                   {sending ? <Loader2 className="size-4 animate-spin" /> : null}
                   Apply color
                 </Button>
+                <Button
+                  size="lg"
+                  variant="secondary"
+                  className="h-11 w-full"
+                  disabled={sending || demo}
+                  onClick={() => void pushFistBump()}
+                >
+                  {sending ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Hand className="size-4" />
+                  )}
+                  Fist bump
+                </Button>
               </CardContent>
             </Card>
 
@@ -644,6 +752,18 @@ export function VectorApp({ demo = false }: { demo?: boolean }) {
                     then try again.
                   </p>
                 ) : null}
+                <Button
+                  className="w-full bg-teal-400 text-zinc-950 hover:bg-teal-300"
+                  disabled={sending || demo}
+                  onClick={() => void pushFistBump()}
+                >
+                  {sending ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Hand className="size-4" />
+                  )}
+                  Fist bump
+                </Button>
                 <Button variant="outline" onClick={disconnect}>
                   Disconnect
                 </Button>

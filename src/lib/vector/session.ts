@@ -487,7 +487,69 @@ async function setEyeOverlayViaConsole(
   return anyOk;
 }
 
-/** WireOS Custom slot (flavor 8) reads this path. */
+async function playAnimationViaLocalProxy(
+  ip: string,
+  animName: string,
+): Promise<boolean> {
+  if (!isLocalDevHost()) return false;
+  try {
+    const res = await fetch("/api/vector-console", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip, action: "play-animation", animName }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { ok?: boolean };
+    return Boolean(data.ok);
+  } catch {
+    return false;
+  }
+}
+
+/** Play a canned animation by name (engine PlayAnimationByName / anim PlayAnimation). */
+async function playAnimationViaConsole(
+  ip: string,
+  animName: string,
+): Promise<boolean> {
+  await ensureLocalNetworkAccess();
+
+  if (await playAnimationViaLocalProxy(ip, animName)) {
+    return true;
+  }
+
+  let anyOk = false;
+  const encoded = encodeURIComponent(animName);
+
+  for (const port of ENGINE_PORTS) {
+    const base = `http://${ip}:${port}`;
+    const calls: Array<Promise<"ok" | "opaque" | "fail">> = [
+      hitRobotHttp(
+        `${base}/consolefunccall?func=PlayAnimationByName&args=${encoded}`,
+      ),
+      hitRobotHttp(`${base}/consolefunccall`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `func=PlayAnimationByName&args=${encoded}`,
+      }),
+      hitRobotHttp(
+        `${base}/consolefunccall?func=PlayAnimation&args=${encoded}`,
+      ),
+      hitRobotHttp(`${base}/consolefunccall`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `func=PlayAnimation&args=${encoded}`,
+      }),
+    ];
+    const results = await Promise.all(calls);
+    if (results.some((r) => r === "ok" || r === "opaque")) anyOk = true;
+  }
+
+  return anyOk;
+}
+
+/** Default fist-bump request anim from AnimationTriggerMap. */
+export const FIST_BUMP_ANIM = "ag_fistbump_requestonce";
+
 const CUSTOM_REMOTE_PATH = "/data/data/customFaceOverlay.jpg";
 
 /**
@@ -513,9 +575,12 @@ export type CustomUploadResult = {
 
 export {
   RobotWriteSetupError,
-  beginRobotWriteSetup,
+  buildBridgeWriteUrl,
   buildRobotWriteSetupScript,
+  copyText,
   isRobotWriteSetupError,
+  openBridgeWriteTab,
+  prepareRobotWriteSetup,
 } from "@/lib/vector/robot-write-setup";
 
 async function blobToBase64(jpeg: Blob): Promise<string> {
@@ -763,6 +828,47 @@ export async function uploadCustomOverlayJpeg(
       flavor: CUSTOM_HTTP_STAGING.flavor,
       via: "http-bridge",
     };
+  }
+
+  // If the put-bridge is installed, open it as a top-level tab with a #gaze payload.
+  // That tab is robot-origin, so PUT works without CORS — and the tab actually does work.
+  if (typeof window !== "undefined" && (await robotPutBridgeInstalled(ip))) {
+    try {
+      const { buildBridgeWriteUrl, openBridgeWriteTab } = await import(
+        "@/lib/vector/robot-write-setup"
+      );
+      const jpegBase64 = await blobToBase64(jpeg);
+      const bridgeWriteUrl = buildBridgeWriteUrl(ip, {
+        path: CUSTOM_HTTP_STAGING.uriPath,
+        jpegBase64,
+        opacity: 0.8,
+        flavor: CUSTOM_HTTP_STAGING.flavor,
+        load: false,
+      });
+      const wrote = await openBridgeWriteTab(bridgeWriteUrl);
+      if (wrote) {
+        return {
+          ok: true,
+          flavor: CUSTOM_HTTP_STAGING.flavor,
+          via: "http-bridge",
+        };
+      }
+      // Fallback: verify disk in case postMessage was blocked but PUT succeeded.
+      const after = await getRobotBytes(ip, CUSTOM_HTTP_STAGING.uriPath);
+      if (after) {
+        const expected = await sha256Hex(jpeg);
+        const got = await sha256Hex(new Blob([after]));
+        if (got === expected) {
+          return {
+            ok: true,
+            flavor: CUSTOM_HTTP_STAGING.flavor,
+            via: "http-bridge",
+          };
+        }
+      }
+    } catch {
+      // fall through
+    }
   }
 
   // Also try staging under persistent (still load as Galaxy flavor if we can't do Custom).
@@ -1051,6 +1157,30 @@ export class VectorSession {
     };
   }
 
+  /** Offer a fist bump (plays ag_fistbump_requestonce on the eng console). */
+  async fistBump(): Promise<SdkResult> {
+    await this.refreshInfo();
+    const ip = this.info?.ip;
+    if (!ip) {
+      throw new Error(
+        "Paired over BLE but Vector has no Wi-Fi IP yet. Put him on your network, then try again.",
+      );
+    }
+
+    const ok = await playAnimationViaConsole(ip, FIST_BUMP_ANIM);
+    if (!ok) {
+      throw new Error(
+        `Couldn’t reach Vector at ${ip} to play fist bump. Same Wi-Fi + Allow local network access.`,
+      );
+    }
+
+    return {
+      statusCode: 200,
+      path: `/consolefunccall?func=PlayAnimationByName&args=${FIST_BUMP_ANIM}`,
+      via: "console",
+    };
+  }
+
   /**
    * Face overlay from unlocked CFW Face console menu
    * (ProcFace_CustomEyes + FlavorOfGay + LOOK_LoadFaceOverlay).
@@ -1095,7 +1225,7 @@ export class VectorSession {
     jpeg: Blob,
     opacity = 0.8,
   ): Promise<SdkResult> {
-    const { RobotWriteSetupError, buildRobotWriteSetupScript } = await import(
+    const { prepareRobotWriteSetup } = await import(
       "@/lib/vector/robot-write-setup"
     );
 
@@ -1111,10 +1241,7 @@ export class VectorSession {
     const uploaded = await uploadCustomOverlayJpeg(ip, jpeg);
     if (!uploaded) {
       const jpegBase64 = await blobToBase64(jpeg);
-      throw new RobotWriteSetupError(
-        ip,
-        buildRobotWriteSetupScript(jpegBase64, opacity),
-      );
+      throw await prepareRobotWriteSetup(ip, jpegBase64, opacity);
     }
 
     // 2) Load only the flavor that matches the verified write target.

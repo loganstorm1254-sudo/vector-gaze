@@ -224,6 +224,38 @@ async function uploadOverlayJpeg(
   };
 }
 
+async function playAnimation(ip: string, animName: string) {
+  let ok = false;
+  let tried = 0;
+  const encoded = encodeURIComponent(animName);
+  const funcs = ["PlayAnimationByName", "PlayAnimation"];
+
+  for (const port of ENGINE_PORTS) {
+    const base = `http://${ip}:${port}`;
+    for (const func of funcs) {
+      const urls = [
+        `${base}/consolefunccall?func=${func}&args=${encoded}`,
+      ];
+      for (const url of urls) {
+        tried += 1;
+        if (await hit(url)) ok = true;
+      }
+      tried += 1;
+      if (
+        await hit(`${base}/consolefunccall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: `func=${encodeURIComponent(func)}&args=${encoded}`,
+        })
+      ) {
+        ok = true;
+      }
+    }
+  }
+
+  return { ok, tried, animName };
+}
+
 export async function POST(request: Request) {
   let body: {
     ip?: string;
@@ -235,6 +267,7 @@ export async function POST(request: Request) {
     opacity?: number;
     jpegBase64?: string;
     bridgeBase64?: string;
+    animName?: string;
   };
   try {
     body = await request.json();
@@ -261,6 +294,18 @@ export async function POST(request: Request) {
       );
     }
     const result = await setVolume(ip, volume);
+    return NextResponse.json({ ip, action, ...result });
+  }
+
+  if (action === "play-animation") {
+    const animName = String(body.animName ?? "").trim();
+    if (!animName || animName.length > 120) {
+      return NextResponse.json(
+        { ok: false, error: "animName required." },
+        { status: 400 },
+      );
+    }
+    const result = await playAnimation(ip, animName);
     return NextResponse.json({ ip, action, ...result });
   }
 
